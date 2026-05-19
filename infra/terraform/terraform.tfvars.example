@@ -1,0 +1,7 @@
+aws_region          = "us-east-1"
+discord_public_key  = "replace-with-your-discord-public-key"
+lambda_architecture = "arm64"
+
+tags = {
+  Environment = "dev"
+}

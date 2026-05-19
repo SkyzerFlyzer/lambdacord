@@ -1,0 +1,14 @@
+.DS_Store
+.env
+**/dist/
+**/.lambda-build/
+**/__pycache__/
+.cursor/
+packaged-lambdas/
+modules/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+infra/terraform/generated_*.tf
+infra/terraform/moved.tf
