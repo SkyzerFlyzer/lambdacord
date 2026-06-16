@@ -199,10 +199,15 @@ configure_build() {
   local build_type="$1"
   local extra_cxx_flags="${2:-}"
   local extra_exe_linker_flags="${3:-}"
+  local cmake_source_dir="${BUILD_ROOT}"
+
+  if [[ -f "${SRC_DIR}/CMakeLists.txt" ]]; then
+    cmake_source_dir="${SRC_DIR}"
+  fi
 
   rm -rf "${BUILD_DIR}"
 
-  cmake -S "${BUILD_ROOT}" -B "${BUILD_DIR}" \
+  cmake -S "${cmake_source_dir}" -B "${BUILD_DIR}" \
     -DCMAKE_CXX_COMPILER=g++ \
     -DCMAKE_BUILD_TYPE="${build_type}" \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \

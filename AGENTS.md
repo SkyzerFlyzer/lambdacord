@@ -128,8 +128,14 @@ Their Lambda `invocation_response` is not rendered by Discord.
 
 They are expected to:
 1. PATCH the original interaction response via `https://discord.com/api/v<DISCORD_API_VERSION>/webhooks/<application_id>/<token>/messages/@original` for every success and safe error path.
-2. Return `{"ok":true}` to the Lambda runtime only after the PATCH succeeds.
-3. Log internal failures and return a Lambda failure only for runtime observability.
+2. Mark the interaction idempotency record `done` after a successful or handled-error PATCH when `DISCORD_INTERACTION_DEDUP_TABLE` is configured, using `discord_interactions::dedup_mark`.
+3. Mark the idempotency record `failed` before returning an unhandled Lambda failure when possible.
+4. Return `{"ok":true}` to the Lambda runtime only after the PATCH succeeds.
+5. Log internal failures and return a Lambda failure only for runtime observability.
+
+If a worker does not yet call `dedup_mark`, duplicate deliveries are still
+suppressed while the ingress record remains `processing` until TTL expiry, but
+re-deliveries cannot surface the terminal `failed` error embed.
 
 Never return a Discord interaction response payload from an async command,
 component, or modal worker Lambda and expect Discord to show it. If the user
@@ -146,7 +152,9 @@ should see it, PATCH `@original`.
 | `DISCORD_PUBLIC_KEY` | Yes | Hex-encoded Ed25519 public key from the Discord developer portal |
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (used in local tests to point at the mock server) |
-| `DISCORD_SKIP_SIGNATURE_VERIFY` | No | Set to `1` to bypass signature verification (local testing only) |
+| `DISCORD_SIGNATURE_MAX_SKEW_SECONDS` | No | Maximum accepted signed timestamp skew. Defaults to `60`. |
+| `DISCORD_INTERACTION_DEDUP_TABLE` | No | DynamoDB table used to suppress duplicate async command/component/modal deliveries. |
+| `DISCORD_SKIP_SIGNATURE_VERIFY` | No | Local-test-only bypass. Release builds compile this out unless `DISCORD_ALLOW_SIGNATURE_BYPASS` is defined. |
 
 ### Handler/router Lambdas
 
@@ -154,6 +162,7 @@ should see it, PATCH `@original`.
 |---|---|---|
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (local testing) |
+| `DISCORD_INTERACTION_DEDUP_TABLE` | No | DynamoDB table that worker Lambdas should update through `discord_interactions::dedup_mark`. |
 
 ### Discord REST helpers
 
@@ -236,5 +245,9 @@ focused on the framework contract.
 - All ephemeral responses use `"flags": 64`.
 - Downstream worker Lambdas must PATCH deferred Discord responses; Lambda
   return values are not user-visible in the async routing path.
+- Downstream worker Lambdas should update the interaction idempotency table with
+  `discord_interactions::dedup_mark` when the dedup env var is configured:
+  mark successful and handled-error PATCHes `done`, and mark unhandled failures
+  `failed` before returning a Lambda failure when possible.
 - Never pass raw internal exception text, upstream API bodies, AWS SDK errors, provider errors, or `ex.what()` directly to Discord users or browser-facing pages. Log internal details to stderr/CloudWatch, then map expected validation cases through module-owned structured error mappings or another explicit allowlist. For infrastructure, Discord API, external API, storage, JSON parsing, or curl failures, send a short friendly retry/action message instead.
 - Validate user-controlled Discord command options before calling storage/API helpers. In particular, parse numeric IDs at the command boundary and return friendly validation copy instead of relying on helper exceptions such as `std::stoll`.

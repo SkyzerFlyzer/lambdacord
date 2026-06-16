@@ -61,6 +61,16 @@ inline std::string interaction_user_id(const json& interaction) {
     return interaction.value("user", json::object()).value("id", "");
 }
 
+inline bool is_valid_route_prefix(const std::string& prefix) {
+    if (prefix.empty()) {
+        return false;
+    }
+
+    return std::all_of(prefix.begin(), prefix.end(), [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-';
+    });
+}
+
 inline InteractionMetadata metadata(const json& interaction) {
     return {
         interaction.value("application_id", ""),

@@ -3,6 +3,7 @@
 import json
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -84,7 +85,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         if function_name in STATE["responses"]:
-            self._write_json(200, STATE["responses"][function_name])
+            response = STATE["responses"][function_name]
+            sleep_seconds = response.get("__sleep_seconds", 0)
+            if sleep_seconds:
+                time.sleep(float(sleep_seconds))
+                response = {key: value for key, value in response.items() if key != "__sleep_seconds"}
+            self._write_json(200, response)
             return
 
         if invocation_type == "Event":

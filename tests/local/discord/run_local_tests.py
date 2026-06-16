@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -250,16 +251,17 @@ def sign_message(key_path, message):
     return signature_path.read_bytes().hex()
 
 
-def make_ingress_event(key_path, body):
-    timestamp = "1710000000"
+def make_ingress_event(key_path, body, *, timestamp=None, is_base64_encoded=False):
+    timestamp = str(int(time.time())) if timestamp is None else timestamp
     signature = sign_message(key_path, (timestamp + body).encode("utf-8"))
+    event_body = base64.b64encode(body.encode("utf-8")).decode("ascii") if is_base64_encoded else body
     return {
         "headers": {
             "x-signature-ed25519": signature,
             "x-signature-timestamp": timestamp,
         },
-        "body": body,
-        "isBase64Encoded": False,
+        "body": event_body,
+        "isBase64Encoded": is_base64_encoded,
     }
 
 
@@ -320,7 +322,6 @@ def run_ingress_tests():
             "AWS_EC2_METADATA_DISABLED": "true",
             "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
             "DISCORD_PUBLIC_KEY": public_key_hex,
-            "DISCORD_SKIP_SIGNATURE_VERIFY": "1",
         }
 
         with LambdaContainer("discord-interactions.zip", positive_env) as container:
@@ -330,6 +331,20 @@ def run_ingress_tests():
             assert_equal(status, 200, "ingress ping HTTP status")
             assert_equal(payload["statusCode"], 200, "ingress ping proxy status")
             assert_equal(json.loads(payload["body"])["type"], 1, "ingress ping body")
+
+            status, text = container.invoke(
+                make_ingress_event(key_path, ping_body, is_base64_encoded=True)
+            )
+            payload = parse_json(text, "ingress base64 ping")
+            assert_equal(payload["statusCode"], 200, "ingress base64 ping proxy status")
+            assert_equal(json.loads(payload["body"])["type"], 1, "ingress base64 ping body")
+
+            stale_timestamp = str(int(time.time()) - 300)
+            status, text = container.invoke(
+                make_ingress_event(key_path, ping_body, timestamp=stale_timestamp)
+            )
+            payload = parse_json(text, "ingress stale timestamp")
+            assert_equal(payload["statusCode"], 401, "ingress stale timestamp proxy status")
 
             reset_mock()
             command_body = json.dumps({"type": 2, "data": {"name": "admin"}})
@@ -388,7 +403,6 @@ def run_ingress_tests():
             assert_equal(body["data"]["choices"][0]["value"], "alpha", "ingress autocomplete choice")
 
         negative_env = dict(positive_env)
-        negative_env.pop("DISCORD_SKIP_SIGNATURE_VERIFY", None)
         with LambdaContainer("discord-interactions.zip", negative_env) as container:
             invalid_event = make_ingress_event(key_path, ping_body)
             invalid_event["headers"]["x-signature-ed25519"] = "00" * 64
@@ -562,6 +576,12 @@ def run_message_component_tests():
         assert_equal(status, 200, "component handler missing custom_id HTTP status")
         assert_in("internal error", text, "component handler missing custom_id error")
 
+        reset_mock()
+        status, text = container.invoke({"type": 3, "data": {"custom_id": "../evil:1"}})
+        assert_equal(status, 200, "component handler invalid custom_id HTTP status")
+        assert_in("internal error", text, "component handler invalid custom_id error")
+        assert_equal(get_logs(), [], "component handler invalid custom_id invoke count")
+
 
 def run_modal_tests():
     reset_mock()
@@ -583,7 +603,13 @@ def run_modal_tests():
         reset_mock()
         status, text = container.invoke({"type": 5, "data": {}})
         assert_equal(status, 200, "modal handler missing custom_id HTTP status")
-        assert_in("missing custom_id", text, "modal handler missing custom_id error")
+        assert_in("internal error", text, "modal handler missing custom_id error")
+
+        reset_mock()
+        status, text = container.invoke({"type": 5, "data": {"custom_id": "foo*bar"}})
+        assert_equal(status, 200, "modal handler invalid custom_id HTTP status")
+        assert_in("internal error", text, "modal handler invalid custom_id error")
+        assert_equal(get_logs(), [], "modal handler invalid custom_id invoke count")
 
 
 def run_autocomplete_tests():
@@ -629,6 +655,24 @@ def run_autocomplete_tests():
         status, text = container.invoke({"type": 4, "data": {"name": "admin"}})
         assert_equal(status, 200, "autocomplete missing focused option HTTP status")
         assert_in("no focused option", text, "autocomplete missing focused option error")
+
+        reset_mock(
+            {
+                "discord-autocomplete-admin-ban-user": {
+                    "__sleep_seconds": 3.5,
+                    "type": 8,
+                    "data": {"choices": [{"name": "late", "value": "late"}]},
+                }
+            }
+        )
+        start = time.monotonic()
+        status, text = container.invoke(payload)
+        elapsed = time.monotonic() - start
+        response = parse_json(text, "autocomplete slow worker fallback")
+        assert_equal(status, 200, "autocomplete slow worker HTTP status")
+        assert_equal(response, {"type": 8, "data": {"choices": []}}, "autocomplete slow worker fallback")
+        if elapsed >= 3.0:
+            raise TestFailure(f"autocomplete slow worker exceeded Discord deadline: {elapsed:.3f}s")
 
 
 def assert_before(text, earlier, later, message):

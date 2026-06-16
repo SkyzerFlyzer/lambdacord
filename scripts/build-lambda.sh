@@ -87,6 +87,7 @@ mkdir -p "${PACKAGED_LAMBDAS_DIR}"
 docker run --rm \
   --platform "${DOCKER_PLATFORM}" \
   -e LAMBDA_ARCH="${LAMBDA_ARCH}" \
+  -e LAMBDA_LOCAL_TESTING="${LAMBDA_LOCAL_TESTING:-0}" \
   -e LAMBDA_PACKAGE_NAME="${LAMBDA_PACKAGE_NAME}" \
   -e PACKAGED_LAMBDAS_DIR="/workspace/packaged-lambdas" \
   -v "${REPO_ROOT}:/workspace" \

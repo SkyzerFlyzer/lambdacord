@@ -25,24 +25,29 @@ locals {
     "discord-interactions" = {
       zip_path = "${local.zip_root}/discord-interactions.zip"
       environment = {
-        DISCORD_PUBLIC_KEY = var.discord_public_key
+        DISCORD_PUBLIC_KEY              = var.discord_public_key
+        DISCORD_INTERACTION_DEDUP_TABLE = aws_dynamodb_table.discord_interaction_dedup.name
       }
     }
     "discord-application-command-handler" = {
       zip_path = "${local.zip_root}/discord-application-command-handler.zip"
       environment = {
-        DISCORD_COMMAND_ROUTES = jsonencode(local.discord_command_routes)
+        DISCORD_COMMAND_ROUTES          = jsonencode(local.discord_command_routes)
+        DISCORD_INTERACTION_DEDUP_TABLE = aws_dynamodb_table.discord_interaction_dedup.name
       }
     }
     "discord-message-component-handler" = {
       zip_path = "${local.zip_root}/discord-message-component-handler.zip"
       environment = {
-        DISCORD_COMPONENT_ROUTES = jsonencode(local.discord_component_routes)
+        DISCORD_COMPONENT_ROUTES        = jsonencode(local.discord_component_routes)
+        DISCORD_INTERACTION_DEDUP_TABLE = aws_dynamodb_table.discord_interaction_dedup.name
       }
     }
     "discord-modal-handler" = {
-      zip_path    = "${local.zip_root}/discord-modal-handler.zip"
-      environment = {}
+      zip_path = "${local.zip_root}/discord-modal-handler.zip"
+      environment = {
+        DISCORD_INTERACTION_DEDUP_TABLE = aws_dynamodb_table.discord_interaction_dedup.name
+      }
     }
     "discord-autocomplete-handler" = {
       zip_path    = "${local.zip_root}/discord-autocomplete-handler.zip"
@@ -66,6 +71,24 @@ locals {
     for function_name in local.router_invoke_targets :
     "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
   ]
+}
+
+resource "aws_dynamodb_table" "discord_interaction_dedup" {
+  name         = "discord-interaction-dedup"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = local.common_tags
 }
 
 data "aws_iam_policy_document" "lambda_assume_role" {
@@ -99,6 +122,18 @@ data "aws_iam_policy_document" "router_lambda_invoke" {
       "lambda:InvokeFunction",
     ]
     resources = local.router_invoke_arns
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+    ]
+    resources = [
+      aws_dynamodb_table.discord_interaction_dedup.arn,
+    ]
   }
 }
 
@@ -136,19 +171,6 @@ resource "aws_lambda_function" "router" {
 resource "aws_lambda_function_url" "discord_interactions" {
   function_name      = aws_lambda_function.router["discord-interactions"].function_name
   authorization_type = "NONE"
-
-  cors {
-    allow_credentials = false
-    allow_methods     = ["POST"]
-    allow_origins     = ["*"]
-    allow_headers = [
-      "content-type",
-      "x-signature-ed25519",
-      "x-signature-timestamp",
-    ]
-    expose_headers = []
-    max_age        = 0
-  }
 }
 
 resource "aws_lambda_permission" "discord_interactions_function_url" {
