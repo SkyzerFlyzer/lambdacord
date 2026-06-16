@@ -15,13 +15,21 @@ namespace discord_interactions {
 
 using json = nlohmann::json;
 
-inline void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
-    const char* region = std::getenv("AWS_REGION");
-    config.region = region == nullptr ? "us-east-1" : region;
+inline std::string require_env(const char* key) {
+    const char* value = std::getenv(key);
+    if (value == nullptr || *value == '\0') {
+        throw std::runtime_error(std::string("Missing required environment variable: ") + key);
+    }
+    return value;
+}
+
+inline void configure_lambda_client(Aws::Client::ClientConfiguration& config,
+                                    long request_timeout_ms = 10000) {
+    config.region = require_env("AWS_REGION");
     config.caFile = "/etc/pki/tls/certs/ca-bundle.crt";
     config.enableTcpKeepAlive = true;
     config.connectTimeoutMs = 3000;
-    config.requestTimeoutMs = 10000;
+    config.requestTimeoutMs = request_timeout_ms;
 
     const char* endpoint = std::getenv("AWS_LAMBDA_ENDPOINT");
     if (endpoint != nullptr && *endpoint != '\0') {
@@ -54,7 +62,9 @@ inline void invoke_async(Aws::Lambda::LambdaClient& client,
 inline json invoke_sync(Aws::Lambda::LambdaClient& client,
                         const std::string& function_name,
                         const json& payload,
+                        long request_timeout_ms = 0,
                         const char* allocation_tag = "DiscordInteractionsSyncInvoke") {
+    (void)request_timeout_ms;
     Aws::Lambda::Model::InvokeRequest request{};
     request.SetFunctionName(function_name);
     request.SetInvocationType(Aws::Lambda::Model::InvocationType::RequestResponse);
@@ -68,6 +78,11 @@ inline json invoke_sync(Aws::Lambda::LambdaClient& client,
     if (!outcome.IsSuccess()) {
         throw std::runtime_error("failed to invoke " + function_name + ": " +
                                  outcome.GetError().GetMessage());
+    }
+    const std::string function_error = outcome.GetResult().GetFunctionError();
+    if (!function_error.empty()) {
+        throw std::runtime_error(
+            "function " + function_name + " failed: " + function_error);
     }
 
     std::ostringstream response_payload{};

@@ -164,6 +164,16 @@ success and error cases. Returning `{"type": 4, ...}` or another Discord
 payload from the Lambda handler is not sufficient because downstream workers
 are invoked asynchronously.
 
+The framework creates a short-lived DynamoDB idempotency record for async
+command/component/modal interactions when `DISCORD_INTERACTION_DEDUP_TABLE` is
+configured. Worker Lambdas should call
+`discord_interactions::dedup_mark(db, table, interaction_id, "done")` after a
+successful or handled-error PATCH, and mark `"failed"` before returning an
+unhandled Lambda failure when possible. Workers that have not adopted this
+helper still get duplicate suppression while the record is `processing`, but
+failed re-deliveries cannot show the generic error embed until the worker marks
+the record `failed`.
+
 Module discovery for build, route validation, and command registration is
 filesystem-based from `modules/*/module.manifest.json`.
 

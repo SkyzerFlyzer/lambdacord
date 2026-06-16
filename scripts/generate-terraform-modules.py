@@ -20,6 +20,8 @@ COMMON_INPUTS = {
     "router_lambda_timeout": "var.router_lambda_timeout",
     "worker_lambda_memory_size": "var.worker_lambda_memory_size",
     "worker_lambda_timeout": "var.worker_lambda_timeout",
+    "discord_interaction_dedup_table_arn": "aws_dynamodb_table.discord_interaction_dedup.arn",
+    "discord_interaction_dedup_table_name": "aws_dynamodb_table.discord_interaction_dedup.name",
     "tags": "local.common_tags",
 }
 
