@@ -31,6 +31,8 @@ Parity here means the *interaction-endpoint* feature set of those frameworks:
 | Localization in command schemas | `name_localizations` etc. | ❌ not validated |
 | Snowflake + mention/timestamp formatting utils | `SnowflakeUtil`, `time()`, `userMention()` | ❌ |
 | Custom-id state encoding | various (customId parsing conventions) | ⚠️ prefix + single page number |
+| Components V2 layout messages | `ContainerBuilder`, `TextDisplayBuilder`… | ❌ |
+| Entitlements / premium prompts | `interaction.entitlements`, premium buttons | ❌ |
 | Fast unit tests + CI | jest/pytest suites, GitHub Actions | ❌ Docker integration harness only |
 | Scaffolding CLI | `create-discord-bot`, cookiecutters | ❌ manual folder creation |
 
@@ -146,9 +148,11 @@ Subagents must treat these as settled; do not re-litigate them mid-task.
   config-drift failure mode. (T3.2 specifies details.)
 - **AD-6: Python tooling changes must go through `scripts/lib/discord_modules.py`**, not
   duplicated parsing in entry-point scripts.
-- **AD-7: No new runtime dependencies** beyond what the builder image already has
-  (libsodium, libcurl, aws-lambda-cpp, aws-sdk-cpp Lambda client, nlohmann/json).
-  doctest is test-only.
+- **AD-7: No new third-party runtime dependencies** beyond what the builder image
+  already has (libsodium, libcurl, aws-lambda-cpp, aws-sdk-cpp, nlohmann/json).
+  doctest is test-only. One sanctioned extension: Phase 5 (T5.1) adds the **DynamoDB
+  client** to the aws-sdk-cpp build in the builder image — first-party AWS SDK only,
+  no other additions.
 
 ---
 
@@ -433,6 +437,89 @@ Task ID format: `T<phase>.<n>`.
   subcommand fixture; no focused option → nullopt.
 - **Depends on:** T0.1, T1.2.
 
+#### T1.9 — Components V2 message layout builders (`components_v2.hpp`)
+
+- **Goal:** Support Discord's current components system (message flag `1 << 15`):
+  container/section/text-display layout messages — parity with discord.js's
+  `ContainerBuilder`/`TextDisplayBuilder`/`SectionBuilder`. Per the component
+  reference this surface is stable and documented (types 9–14, 17); it is not
+  experimental.
+- **Files:** `src/include/discord_interactions/components_v2.hpp`,
+  `src/include/discord_interactions/limits.hpp` (add
+  `components_per_message = 40`, `text_display_content = 4000`),
+  `tests/unit/cpp/test_components_v2.cpp`.
+- **API specification:**
+  ```cpp
+  inline constexpr int message_flag_components_v2 = 1 << 15;
+  json text_display(const std::string& content);       // type 10; clamps to 4000 via limits
+  json thumbnail_component(const std::string& media_url,
+                           const std::string& description = "",
+                           bool spoiler = false);      // type 11
+  json section(const json& text_displays /*array, 1..3*/,
+               const json& accessory);                 // type 9; accessory = thumbnail
+                                                       // or button (from T1.4);
+                                                       // throws ModuleError(validation)
+                                                       // on 0 or >3 text displays
+  json media_gallery(const json& items /*array of {media:{url}, description?, spoiler?}*/);
+                                                       // type 12; 1..10 items enforced
+  json file_component(const std::string& attachment_url,
+                      bool spoiler = false);           // type 13
+  json separator(bool divider = true, int spacing = 1);// type 14; spacing ∈ {1,2}
+  json container(const json& components /*array*/,
+                 std::optional<uint32_t> accent_color = std::nullopt,
+                 bool spoiler = false);                // type 17
+  // Assembles {"flags": message_flag_components_v2, "components": [...]}.
+  // Validates recursive component count ≤ limits::components_per_message
+  // (throws ModuleError code="too_many_components_v2", validation).
+  json components_v2_message(const json& components);
+  ```
+  CV2 messages cannot carry `content` or `embeds`; `components_v2_message` owns the
+  whole payload shape so callers cannot mix them accidentally (document in header
+  comment). Interactive components from T1.4 (buttons, selects, action rows) remain
+  legal children inside containers/sections.
+- **Test specification:** ≥ 14 cases: exact `type` codes for every factory (9, 10, 11,
+  12, 13, 14, 17); section with 1 and 3 text displays plus button accessory; section
+  with 0 or 4 throws; separator spacing values and divider flag; media gallery item
+  bounds; container with accent color present/omitted; text display clamped at 4000;
+  flag present on assembled message; recursive count enforcement — 40 components
+  nested inside containers passes, 41 throws; T1.4 action row nested in a container
+  composes.
+- **Depends on:** T0.1, T1.2, T1.4.
+
+#### T1.10 — Entitlements + premium button (`premium.hpp`)
+
+- **Goal:** Monetized-app parity: read the interaction's `entitlements` array, gate
+  features on SKU ownership, and prompt upgrades with the premium button style.
+  Note: Discord has **deprecated** the `PREMIUM_REQUIRED` (type 10) interaction
+  callback in favor of style-6 premium buttons — this task implements the current
+  mechanism and records the deprecated constant for completeness only.
+- **Files:** `src/include/discord_interactions/premium.hpp`,
+  `src/include/discord_interactions/response.hpp` (add one constant, see below),
+  `tests/unit/cpp/test_premium.cpp`.
+- **API specification:**
+  ```cpp
+  json entitlements(const json& interaction);   // array; empty array if absent
+  // True when an entitlement matches sku_id, is not deleted, and either has no
+  // ends_at / null ends_at or ends_at > now_iso8601 (lexicographic compare of
+  // ISO-8601 UTC strings; empty now_iso8601 skips the expiry check).
+  bool has_entitlement_for_sku(const json& interaction, const std::string& sku_id,
+                               const std::string& now_iso8601 = "");
+  json premium_button(const std::string& sku_id);  // {type:2, style:6, sku_id} —
+                                                   // no label, no custom_id (Discord
+                                                   // renders these itself)
+  // response.hpp addition:
+  // inline constexpr int response_premium_required = 10;  // DEPRECATED by Discord —
+  //                                                       // use premium_button instead
+  ```
+- **Test specification:** ≥ 10 cases: missing/empty entitlements; matching SKU true;
+  non-matching false; `deleted: true` excluded; `ends_at` null passes; `ends_at`
+  in the past fails / in the future passes (with `now_iso8601` supplied); expiry
+  check skipped when `now_iso8601` empty; premium button JSON has `sku_id` and style
+  6 but neither `label` nor `custom_id` keys; constant equals 10 and header comment
+  marks it deprecated (grep-assert in test or via static_assert on the value).
+- **Depends on:** T0.1. (Standalone factory — deliberately does not extend T1.4's
+  `ButtonStyle` enum, since premium buttons take `sku_id` instead of `custom_id`.)
+
 ---
 
 ### Phase 2 — REST capabilities (serialize T2.1 → T2.2; T2.3 after T2.1)
@@ -599,9 +686,9 @@ Task ID format: `T<phase>.<n>`.
     bool seen_before(const std::string& interaction_id);  // false first time, true after; LRU evict
   };
   ```
-  Document explicitly in CLAUDE.md that cross-container dedup requires module-owned
-  storage and is out of framework scope. Do **not** wire it into router Lambdas in this
-  task (workers own the decision).
+  Document explicitly in CLAUDE.md that the in-process guard only covers warm-container
+  retries; cross-container dedup is the opt-in Phase 5 DynamoDB claim (T5.2). Do **not**
+  wire it into router Lambdas in this task (workers own the decision).
 - **Test specification:** ≥ 8 cases: first-seen false; second-seen true; eviction at
   capacity; eviction order (LRU not FIFO — re-seeing refreshes); capacity 1 edge;
   empty id handled.
@@ -738,15 +825,108 @@ Task ID format: `T<phase>.<n>`.
 
 ---
 
+### Phase 5 — Storage-backed interaction dedup (opt-in)
+
+**Rationale:** AWS async invocation retries can re-run a worker on a *different*
+container, which T3.3's in-process LRU cannot catch. This phase gives workers an
+opt-in, framework-owned DynamoDB claim so a retried invoke never double-PATCHes or
+double-executes a side effect — the serverless equivalent of other frameworks'
+single-dispatch guarantee, made durable.
+
+**Design decisions (fixed, do not re-litigate in-task):**
+
+- Claim = DynamoDB conditional `PutItem` with `attribute_not_exists(interaction_id)`
+  and a TTL attribute. First writer wins; a retry hits
+  `ConditionalCheckFailedException` and skips.
+- **Fail-open:** on any DynamoDB/infra error, log to stderr and proceed. A duplicate
+  Discord PATCH is strictly better than a silently dropped interaction.
+- Opt-in per worker via env `DISCORD_IDEMPOTENCY_TABLE`; unset → claim is a no-op
+  that always returns "proceed".
+- TTL default 3600 s (interaction tokens expire at 15 min; 1 h leaves audit slack).
+- Local testing reuses the existing endpoint-override pattern: new optional env
+  `AWS_DYNAMODB_ENDPOINT`, mirroring `AWS_LAMBDA_ENDPOINT`.
+
+#### T5.1 — Builder image: add the DynamoDB client
+
+- **Goal:** Make `Aws::DynamoDB::DynamoDBClient` available to Lambda builds (the image
+  currently builds aws-sdk-cpp with the Lambda client only).
+- **Files:** `docker/lambda-builder/Dockerfile` (extend the aws-sdk-cpp `BUILD_ONLY`
+  list with `dynamodb`), CLAUDE.md dependency table,
+  `tests/local/discord/fixtures/build-smoke-dynamodb/main.cpp` (minimal `main()`
+  constructing a value-initialized client config + `DynamoDBClient`; test fixture
+  only, never deployed).
+- **Test specification / acceptance (RED = fixture fails to build before the
+  Dockerfile change):** `scripts/build-lambda.sh tests/local/discord/fixtures/build-smoke-dynamodb`
+  fails on the current image, succeeds after; an existing Lambda
+  (`src/lambdas/discord-interactions`) still builds; note image rebuild time impact in
+  the commit body.
+- **Depends on:** nothing (parallel-safe from Wave 1).
+
+#### T5.2 — Idempotency claim helper (`idempotency_store.hpp`)
+
+- **Goal:** The claim primitive workers call before acting.
+- **Files:** `src/include/discord_interactions/idempotency_store.hpp`,
+  `tests/unit/cpp/test_idempotency_store.cpp` (this test target may link the AWS SDK
+  DynamoDB lib — T0.1's escape hatch), root `infra/terraform`: optional
+  `aws_dynamodb_table` behind variable `discord_idempotency_table_enabled`
+  (hash key `interaction_id` (S), TTL attribute `expires_at`, on-demand billing),
+  outputs for table name + ARN so module Terraform can attach worker IAM;
+  CLAUDE.md env-var table + worker guidance section.
+- **API specification:**
+  ```cpp
+  struct ClaimRequestParts { std::string table{}; json item{}; std::string condition{}; };
+  // Pure, unit-testable: item = {interaction_id: {S: id}, expires_at: {N: now+ttl}};
+  // condition = "attribute_not_exists(interaction_id)".
+  ClaimRequestParts build_claim_request(const std::string& table,
+                                        const std::string& interaction_id,
+                                        int64_t now_epoch_s, int64_t ttl_s = 3600);
+  std::string idempotency_table_from_env();  // DISCORD_IDEMPOTENCY_TABLE or ""
+  // Executes the claim. Returns true = proceed (claimed, or table empty [opt-out],
+  // or infra error [fail-open, logged to stderr]); false = duplicate
+  // (ConditionalCheckFailedException only).
+  bool claim_interaction(Aws::DynamoDB::DynamoDBClient& client, const std::string& table,
+                         const std::string& interaction_id, int64_t now_epoch_s,
+                         int64_t ttl_s = 3600);
+  ```
+- **Test specification (unit):** ≥ 8 cases on the pure parts: item shape (S/N types
+  as strings per DynamoDB JSON), TTL arithmetic, condition string, empty-table
+  no-op path, env helper set/unset/empty; the live-client branch is integration
+  territory (T5.3) — say so in the test file.
+- **Depends on:** T0.1, T5.1.
+
+#### T5.3 — Integration coverage for dedup
+
+- **Goal:** Prove end-to-end that a retried identical invoke produces exactly one
+  user-visible PATCH.
+- **Files:** `tests/local/discord/mock_lambda_server.py` (minimal DynamoDB `PutItem`
+  endpoint routed on the `X-Amz-Target: DynamoDB_20120810.PutItem` header, honoring
+  `attribute_not_exists` conditions against an in-memory table),
+  `tests/local/discord/run_local_tests.py` (new suite `dedup`),
+  `tests/local/discord/fixtures/discord-cmd-test-dedup/main.cpp` (worker fixture:
+  claim via `DISCORD_IDEMPOTENCY_TABLE` + `AWS_DYNAMODB_ENDPOINT`, then PATCH),
+  `tests/unit/python/test_mock_dynamodb.py`, CLAUDE.md Local Testing + env tables
+  (`AWS_DYNAMODB_ENDPOINT`).
+- **Test specification:** Python unit (write first): mock PutItem stores item; second
+  conditional put returns `ConditionalCheckFailedException` error shape; unconditional
+  put overwrites; reset clears state. Integration: same interaction payload invoked
+  twice → exactly one Discord PATCH recorded; two distinct interaction ids → two
+  PATCHes; env unset → both invokes PATCH (opt-out honored).
+- **Depends on:** T5.2, T2.3 (shares mock-server files — must run after it), T0.2.
+
+---
+
 ## 6. Dependency graph / suggested waves
 
 ```
 Wave 0 (serial):   T0.1 → T0.2 → T0.3
-Wave 1 (parallel): T1.1  T1.2  T1.6  T3.3          (need only T0.1/T0.2)
+Wave 1 (parallel): T1.1  T1.2  T1.6  T1.10  T3.3  T5.1     (need only T0.1/T0.2 or nothing)
 Wave 2 (parallel): T1.3  T1.4  T1.5  T1.7  T1.8    (need T1.2)   |  T2.1  |  T4.1  T4.2
-Wave 3 (parallel): T2.2  T3.1  T3.2  T4.3           (T2.2 needs T2.1)
+Wave 3 (parallel): T1.9  T2.2  T3.1  T3.2  T4.3  T5.2      (T1.9 needs T1.4; T2.2 needs
+                                                            T2.1; T5.2 needs T5.1)
 Wave 4 (parallel): T2.3  T3.4  T4.4
-Wave 5 (serial):   T4.5
+Wave 5 (serial):   T5.3                                     (after T2.3 — shares the
+                                                            mock-server files)
+Wave 6 (serial):   T4.5
 ```
 
 Rules for the orchestrator:
@@ -871,14 +1051,24 @@ tests/unit/cpp/CMakeLists.txt — add your test file to it).
    `scripts/build-all-lambdas.sh && scripts/test-local-discord-lambdas.sh` and fix
    regressions before proceeding.
 6. Out of scope, do not accept scope creep from subagents: gateway/websocket features,
-   voice, sharding, message-content intents, storage-backed dedup, OAuth flows,
-   Components V2 (`IS_COMPONENTS_V2` flag) — record as future work instead.
+   voice, sharding, message-content intents, OAuth flows, and the modal-only new
+   component types (Label 18, File Upload 19, Radio Group 21, Checkbox Group 22,
+   Checkbox 23 — they layer on T1.5 + T1.9 and are deferred) — record as future work
+   instead.
 
 ## 9. Future work (explicitly deferred)
 
-- Components V2 layout (`flags: 1<<15`, container/section components).
-- Attachment/file upload support in webhook messages (multipart curl).
-- Entitlements / premium interactions (`type 10 PREMIUM_REQUIRED` replies).
-- Storage-backed cross-container interaction dedup.
-- Localized runtime replies (framework-level copy catalogue).
-- CI-side integration harness via arm64 runners or x86_64 RIE builds.
+Each entry carries its reason; "deferred" means considered and consciously excluded,
+not forgotten. (Components V2, entitlements/premium, and storage-backed dedup were
+originally listed here and have been promoted to tasks T1.9, T1.10, and Phase 5.)
+
+- Attachment/file upload support in webhook messages — requires multipart/form-data
+  in the curl layer, a materially different code path from T2.x; spec it as its own
+  phase when needed.
+- Modal-only new component types (Label 18, File Upload 19, Radio Group 21,
+  Checkbox Group 22, Checkbox 23) — layer cleanly on T1.5 + T1.9 once both have
+  landed; adding them now would couple two otherwise-independent tasks.
+- Localized runtime replies (framework-level copy catalogue) — T4.1 validates schema
+  localizations; localizing runtime copy needs a locale-selection design first.
+- CI-side integration harness — needs arm64 runners or x86_64 RIE builds; runner
+  infrastructure problem, not a code problem.
