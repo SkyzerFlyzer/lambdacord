@@ -135,11 +135,15 @@ Subagents must treat these as settled; do not re-litigate them mid-task.
 - **AD-4: Routing changes stay mechanical.** New route kinds get the same
   "derive-name-from-payload" treatment: user commands → `discord-usercmd-<name>`,
   message commands → `discord-msgcmd-<name>` (names lowercased, spaces → `-`).
-- **AD-5: Per-route response behavior lives in module manifests**, resolved by the
-  ingress Lambda via a build-time-generated routing table is **out of scope**; instead
-  ephemeral-defer is chosen by the ingress from a static env-configured allowlist
-  (`DISCORD_EPHEMERAL_DEFER_ROUTES`, comma-separated command paths) — simplest thing
-  that preserves statelessness. (T3.2 specifies details.)
+- **AD-5: Per-route response behavior is declared in module manifests and delivered
+  to the ingress as generated configuration.** Module authors set
+  `"ephemeral_defer": true` on a command route in `module.manifest.json`;
+  `scripts/generate-terraform-modules.py` merges these across installed modules and
+  emits the resulting comma-separated command-path list into the ingress Lambda's
+  `DISCORD_EPHEMERAL_DEFER_ROUTES` env var (generated Terraform). The ingress stays
+  stateless and mechanical — it only parses the env var; it never reads manifests at
+  runtime. Declaration lives with the command that owns it, so there is no
+  config-drift failure mode. (T3.2 specifies details.)
 - **AD-6: Python tooling changes must go through `scripts/lib/discord_modules.py`**, not
   duplicated parsing in entry-point scripts.
 - **AD-7: No new runtime dependencies** beyond what the builder image already has
@@ -533,25 +537,51 @@ Task ID format: `T<phase>.<n>`.
   `discord-usercmd-report-user` (async, recorded by mock).
 - **Depends on:** T0.1, T0.2; integration parts after T0.3 optional.
 
-#### T3.2 — Configurable ephemeral defer at ingress
+#### T3.2 — Manifest-driven ephemeral defer at ingress
 
 - **Goal:** Let commands opt into an ephemeral deferred ACK (`{type:5, data:{flags:64}}`)
-  — parity with `deferReply({ ephemeral: true })`.
+  — parity with `deferReply({ ephemeral: true })` — declared where the command lives
+  (its module manifest), with the plumbing generated, not hand-maintained.
 - **Files:** `src/lambdas/discord-interactions/main.cpp`,
   `src/include/discord_interactions/interaction.hpp` (pure helper:
   `bool route_in_csv_allowlist(const std::string& command_path, const std::string& csv)`),
-  unit + integration tests, env-var docs in CLAUDE.md + README + Terraform variable
-  passthrough (root `variables.tf` / ingress module env).
-- **Specification:** New optional env `DISCORD_EPHEMERAL_DEFER_ROUTES` on the ingress
-  Lambda: comma-separated command paths (e.g. `account link,account unlink`). On type 2,
-  if the command path matches → respond `{type:5, data:{flags:64}}`; else current
-  `{type:5}`. Matching is exact on the full path, whitespace-trimmed per entry.
-  Component (type 3) and modal (type 5) behavior unchanged.
-- **Test specification:** C++ unit: allowlist parser (empty env, one entry, trim,
-  no-match, exact-match-only — `account` must not match `account link`). Integration:
-  with env set on the RIE container, ingress response body contains `flags: 64`;
-  without env, unchanged.
-- **Depends on:** T0.1.
+  `scripts/lib/discord_modules.py` (manifest field parsing/validation + merged-list
+  helper `ephemeral_defer_routes(manifests)`), `scripts/generate-terraform-modules.py`
+  (emit merged list into the ingress env var in generated Terraform),
+  C++ unit tests, `tests/unit/python/test_ephemeral_defer.py`, integration tests,
+  env-var + manifest-field docs in CLAUDE.md + README.
+- **Specification:**
+  - **Manifest:** a command route entry may carry `"ephemeral_defer": true`. Today
+    command routes map route → function-name string, so the schema gains an
+    alternative object form: `"account link": {"lambda": "discord-cmd-account-link",
+    "ephemeral_defer": true}`. The plain-string form remains valid and means
+    `ephemeral_defer: false`; `routing.hpp`'s `route_from_manifest_entry` and all
+    Python route parsing must accept both forms. Validation rejects
+    `ephemeral_defer` on non-command route kinds and non-boolean values.
+  - **Generator:** `scripts/generate-terraform-modules.py` collects all command paths
+    with `ephemeral_defer: true` across installed modules (sorted, deduplicated) and
+    emits them as a comma-separated string into the ingress Lambda's
+    `DISCORD_EPHEMERAL_DEFER_ROUTES` env var in the generated Terraform. Empty list →
+    variable omitted or empty; both must be handled by the ingress.
+  - **Ingress:** reads optional env `DISCORD_EPHEMERAL_DEFER_ROUTES` (comma-separated
+    command paths, e.g. `account link,account unlink`). On type 2, if the command path
+    matches → respond `{type:5, data:{flags:64}}`; else current `{type:5}`. Matching
+    is exact on the full path, whitespace-trimmed per entry. Component (type 3) and
+    modal (type 5) behavior unchanged. The ingress never reads manifests at runtime.
+- **Test specification:**
+  - C++ unit: allowlist parser (empty/unset env, one entry, trim, no-match,
+    exact-match-only — `account` must not match `account link`);
+    `route_from_manifest_entry` accepts both string and object route forms.
+  - Python unit (write first): object-form route parsing; merged list is sorted +
+    deduped across multiple module fixtures; string-form routes contribute nothing;
+    validation errors for `ephemeral_defer` on component routes and for non-boolean
+    values; generator output contains the env var with the expected value (assert on
+    generated Terraform text against a tmp-dir module fixture); empty case emits no
+    stale value.
+  - Integration: with env set on the RIE container, ingress response body contains
+    `flags: 64` for a listed command and not for an unlisted one; without env,
+    unchanged.
+- **Depends on:** T0.1, T0.2.
 
 #### T3.3 — Async retry dedup guard (interaction idempotency)
 
@@ -723,7 +753,8 @@ Rules for the orchestrator:
 
 - Never run two tasks that list the same file in **Files** concurrently
   (e.g. T1.3/T1.4/T1.5 all touch only their own files — safe; T3.1 and T3.4 both touch
-  `discord-application-command-handler/main.cpp` — serialize).
+  `discord-application-command-handler/main.cpp` — serialize; T3.1 and T3.2 both touch
+  `scripts/lib/discord_modules.py` within Wave 3 — serialize).
 - Each task lands as one commit on the working branch before its dependents start.
 - If a subagent reports an API-spec conflict (spec in §5 is wrong against reality),
   it must stop and return the conflict rather than improvise a different public API.
