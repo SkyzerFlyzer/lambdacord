@@ -239,7 +239,7 @@ Task ID format: `T<phase>.<n>`.
 
 ---
 
-### Phase 1 — Core library parity (all tasks depend on T0.1 only; parallelizable)
+### Phase 1 — Core library parity (file-disjoint; parallelizable per the §6 waves and per-task dependencies)
 
 #### T1.1 — Typed command option access (`options.hpp`)
 
@@ -690,7 +690,11 @@ Task ID format: `T<phase>.<n>`.
   correct path; delete recorded. Python-unit-test the new mock endpoints too
   (`tests/unit/python/test_mock_lambda_server.py`) since the mock is plain Python.
 - **Acceptance:** `scripts/test-local-discord-lambdas.sh` green including new suite;
-  suite selectable via existing suite-selection mechanism.
+  suite selectable via existing suite-selection mechanism. Fixture Lambdas under
+  `tests/local/discord/fixtures/` are **not** part of `scripts/build-all-lambdas.sh`
+  (they are never deployed); the harness builds their zips on demand via
+  `scripts/build-lambda.sh` (honoring `LAMBDA_SKIP_IMAGE_BUILD=1`) before running the
+  suites that need them — this task establishes that mechanism, T5.1/T5.3 reuse it.
 - **Depends on:** T2.1, T2.2, T0.2.
 
 ---
@@ -709,8 +713,10 @@ Task ID format: `T<phase>.<n>`.
 - **Specification:** `data.type == 2` → invoke `discord-usercmd-<suffix>`;
   `data.type == 3` → `discord-msgcmd-<suffix>`; absent/1 → existing behavior exactly.
   Python side: `discord_modules.py` route-kind vocabulary gains `user_commands` and
-  `message_commands`; registration validation accepts type-2/3 schema entries (no
-  `description`, no `options` — reject if present, matching Discord rules).
+  `message_commands` only. The type-2/3 schema *shape* rules (no `description`, no
+  `options`) are owned by T4.1, which lands a wave earlier — this task must reuse
+  T4.1's validation, not re-implement it; its Python tests assert routing/vocabulary
+  behavior plus one end-to-end case proving T4.1's rules fire for a type-2 entry.
 - **Test specification:** C++ unit: kind detection fixtures (types 1/2/3/missing),
   suffix derivation ("Report User" → `report-user`). Python unit: schema validation
   accepts/rejects correctly. Integration: type-2 command interaction routes to
@@ -725,9 +731,13 @@ Task ID format: `T<phase>.<n>`.
 - **Files:** `src/lambdas/discord-interactions/main.cpp`,
   `src/include/discord_interactions/interaction.hpp` (pure helper:
   `bool route_in_csv_allowlist(const std::string& command_path, const std::string& csv)`),
-  `scripts/lib/discord_modules.py` (manifest field parsing/validation + merged-list
-  helper `ephemeral_defer_routes(manifests)`), `scripts/generate-terraform-modules.py`
-  (emit merged list into the ingress env var in generated Terraform),
+  `src/include/discord_interactions/routing.hpp` (`route_from_manifest_entry` accepts
+  the object route form), `scripts/lib/discord_modules.py` (manifest field
+  parsing/validation + merged-list helper `ephemeral_defer_routes(manifests)`),
+  `scripts/generate-terraform-modules.py` (emit merged list into the ingress env var
+  in generated Terraform), root `infra/terraform/main.tf` (wire the generated value
+  into the ingress Lambda's environment — the ingress resource is root-owned, so the
+  generator emits a local and the root resource references it),
   C++ unit tests, `tests/unit/python/test_ephemeral_defer.py`, integration tests,
   env-var + manifest-field docs in CLAUDE.md + README.
 - **Specification:**
@@ -967,7 +977,10 @@ storage: a naive claim-at-start would suppress crash recovery and strand users o
   fails on the current image, succeeds after; an existing Lambda
   (`src/lambdas/discord-interactions`) still builds; note image rebuild time impact in
   the commit body.
-- **Depends on:** nothing (parallel-safe from Wave 1).
+- **Depends on:** nothing — but **not parallel-safe with other builders**: this task
+  rebuilds the shared Docker builder image tag while every other Wave-1 task runs
+  `scripts/test-unit.sh` against it. Run it solo at the start or end of Wave 1 (see
+  §6 rules).
 
 #### T5.2 — Durable idempotency primitives (`idempotency_store.hpp`)
 
@@ -1064,10 +1077,31 @@ Wave 6 (serial):   T4.5
 
 Rules for the orchestrator:
 
-- Never run two tasks that list the same file in **Files** concurrently
-  (e.g. T1.3/T1.4/T1.5 all touch only their own files — safe; T3.1 and T3.4 both touch
-  `discord-application-command-handler/main.cpp` — serialize; T3.1 and T3.2 both touch
-  `scripts/lib/discord_modules.py` within Wave 3 — serialize).
+- Never run two tasks that list the same file in **Files** concurrently. The known
+  same-wave overlaps — serialize these pairs (either order unless stated):
+
+  | Wave | Tasks | Shared file(s) |
+  |---|---|---|
+  | 1 | T5.1 vs. *everything* | the Docker builder **image tag** — T5.1 rebuilds it while other tasks run `scripts/test-unit.sh` against it; run T5.1 solo first or last in the wave |
+  | 1 | T3.3, T5.1 | `CLAUDE.md` (different sections) |
+  | 2 | T1.4, T2.1 | `src/include/discord_interactions/response.hpp` |
+  | 2 | T4.1, T4.2 | `scripts/lib/discord_modules.py` — run T4.1 first; T4.2's consistency check may reuse T4.1 validation entry points |
+  | 3 | T3.1, T3.2 | `interaction.hpp`, `scripts/lib/discord_modules.py`, `tests/local/discord/run_local_tests.py` |
+  | 3 | T3.2, T5.2 | root `infra/terraform/` (`main.tf` / `variables.tf` / `outputs.tf`) |
+  | 3 | T3.1, T3.2, T4.3, T5.2 | `CLAUDE.md` (and `README.md` for T3.2/T4.3) — see living-docs rule below |
+  | 4 | T2.3, T3.4 | `tests/local/discord/run_local_tests.py`, and T3.4's 404-function scenario needs mock-server behavior T2.3 introduces — run **T2.3 first** |
+
+- **Living-docs rule:** `CLAUDE.md`, `README.md`, and `AGENTS.md` are touched by many
+  tasks and are the main merge hotspot. Subagents append to their own clearly-scoped
+  section/table row only; when a wave has multiple doc-touching tasks, the orchestrator
+  merges those commits sequentially and resolves any overlap itself rather than
+  bouncing the task. T4.5 is the final reconciliation pass.
+- Cross-wave overlaps are safe by construction (earlier wave lands first) but worth
+  knowing when re-ordering: `response.hpp` (T1.10 → T1.4/T2.1), `paginator.hpp`
+  (T1.7 → T4.4), `modal.hpp` (T1.5 → T1.11), router `main.cpp`s (T3.1 → T3.4),
+  `mock_lambda_server.py` + `run_local_tests.py` (T2.3 → T5.3),
+  `discord_modules.py` (T4.1/T4.2 → T3.1/T3.2). Never promote a task past a wave
+  that feeds it one of these files.
 - Each task lands as one commit on the working branch before its dependents start.
 - If a subagent reports an API-spec conflict (spec in §5 is wrong against reality),
   it must stop and return the conflict rather than improvise a different public API.
@@ -1147,7 +1181,7 @@ embed_description=4096, embed_fields=25, embed_field_name=256, embed_field_value
 embed_footer=2048, embed_author=256, embed_total=6000, embeds_per_message=10,
 action_rows=5, buttons_per_row=5, select_options=25, autocomplete_choices=25,
 choice_name=100, custom_id=100, modal_title=45, text_input_label=45,
-text_input_value=4000) and
+text_input_value=4000, components_per_message=40, text_display_content=4000) and
   std::string discord_interactions::safe_truncate(const std::string& text, size_t max_bytes);
 safe_truncate must never split a multibyte UTF-8 sequence and appends "…" (U+2026,
 3 bytes, counted within max_bytes) when it cuts.
