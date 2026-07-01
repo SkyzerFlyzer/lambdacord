@@ -153,6 +153,23 @@ Subagents must treat these as settled; do not re-litigate them mid-task.
   doctest is test-only. One sanctioned extension: Phase 5 (T5.1) adds the **DynamoDB
   client** to the aws-sdk-cpp build in the builder image — first-party AWS SDK only,
   no other additions.
+- **AD-8: All in-Lambda waiting is bounded by the invocation deadline.** Sleeping in
+  a Lambda is billed wall-clock time — tolerable on async workers — but sleeping past
+  the function timeout kills the invocation mid-flight and turns one rate-limit into
+  a duplicate execution via AWS's async retry. Every retry policy must be clampable
+  to the deadline `aws-lambda-cpp` exposes on the invocation request (T2.1), and the
+  **sync interaction paths (ingress, autocomplete) never sleep-retry** — they already
+  spend their 3-second Discord budget on up to two cold starts.
+- **AD-9: Idempotency defaults to completion markers, not claims.** AWS async invoke
+  is at-least-once *and* retries failed invocations — both duplicate-success and
+  retry-after-crash occur. Claim-at-start ("first writer wins, retry skips") breaks
+  crash recovery: a worker that claims then dies before PATCHing leaves the user on
+  "thinking…" forever, because the retry sees the claim and skips. The framework
+  default is therefore *record completion after the PATCH succeeds; skip only work
+  already completed* — duplicates of success skip, retries of crashes re-run. The
+  residual crash-after-PATCH window merely repeats an idempotent PATCH. Claim-at-start
+  exists only as an explicit opt-in for non-idempotent side effects where a dropped
+  response is preferable to double execution (T3.3, Phase 5).
 
 ---
 
@@ -407,7 +424,11 @@ Task ID format: `T<phase>.<n>`.
 #### T1.7 — Structured custom_id state codec (`custom_id.hpp`)
 
 - **Goal:** Replace ad-hoc `prefix:arg` handling with a validated codec usable by
-  paginator and module components.
+  paginator and module components. In this serverless architecture the custom_id is
+  the framework's **only free state channel** — there is no in-memory session between
+  interactions — so the codec's 100-char budget is a hard architectural boundary;
+  state that doesn't fit belongs in module-owned storage, and the header comment must
+  say so.
 - **Files:** `src/include/discord_interactions/custom_id.hpp`,
   `tests/unit/cpp/test_custom_id.cpp`; refactor `paginator.hpp` to use it (public
   paginator API unchanged).
@@ -590,8 +611,17 @@ Task ID format: `T<phase>.<n>`.
   ```cpp
   struct RestResponse { long status = 0; std::string body{}; };
   struct RestRetryPolicy { int max_attempts = 3; long max_total_wait_ms = 8000; };
+  // AD-8: sync interaction paths must use this — single attempt, zero sleep.
+  inline constexpr RestRetryPolicy no_retry{1, 0};
+  // AD-8: clamp the wait budget to the invocation deadline minus a safety margin,
+  // so a retry never outlives the function timeout. Deadline comes from
+  // aws::lambda_runtime::invocation_request::deadline.
+  RestRetryPolicy retry_policy_for_deadline(
+      std::chrono::time_point<std::chrono::system_clock> deadline,
+      long safety_margin_ms = 2000, int max_attempts = 3);
   // Executes with retries: on 429 sleeps min(retry_after from JSON body or
   // Retry-After header, remaining budget); on 5xx exponential backoff 250ms*2^n.
+  // A sleep that would exceed the remaining budget is not taken — throw instead.
   // Throws ModuleError(code="discord_api_error", category=upstream) after exhaustion;
   // 4xx (non-429) throws immediately with status in safe_context.
   RestResponse discord_request(const std::string& method, const std::string& url,
@@ -602,13 +632,19 @@ Task ID format: `T<phase>.<n>`.
                           const std::string& suffix /* "/messages/@original" etc. */);
   ```
   Include a `User-Agent: DiscordBot (lambdacord, 1.0)` header on every request.
+  Document in the header comment that sleeping is billed Lambda wall-clock time —
+  acceptable on async workers whose alternative is a failed invoke and a full
+  re-execution, and forbidden on sync paths (use `no_retry`).
   **Testability requirement:** the retry/parse logic (`parse_retry_after(status,
   headers_json, body)` and `backoff_ms(attempt)`) must be exposed as pure functions so
   unit tests cover them without network; `discord_request` itself is covered by the
   integration harness (T2.3 wires mock-server assertions).
-- **Test specification (unit):** ≥ 10 cases on the pure functions: retry_after from
+- **Test specification (unit):** ≥ 13 cases on the pure functions: retry_after from
   JSON body (float seconds → ms), from header, missing → default; backoff sequence;
-  budget clamping; 4xx classification; URL joiner with/without leading slash.
+  budget clamping; 4xx classification; URL joiner with/without leading slash;
+  `retry_policy_for_deadline` with ample remaining time (full budget), tight
+  remaining time (clamped), and already-past deadline (zero budget, one attempt);
+  `no_retry` constants.
 - **Depends on:** T0.1; uses `errors.hpp`.
 
 #### T2.2 — Followup / edit / delete interaction messages (`webhook_messages.hpp`)
@@ -630,7 +666,10 @@ Task ID format: `T<phase>.<n>`.
   ```
   All built on `discord_request`. Unit tests cover URL construction (expose
   `followup_path(...)` helpers as pure functions); behavior is integration-tested in
-  T2.3.
+  T2.3. Header comment must state that interaction tokens expire after **15 minutes**
+  — long-running work that outlives the token cannot reply at all, and (serverless
+  corollary) cannot outlive the Lambda timeout anyway; workflows longer than the
+  worker timeout need their own delivery design and are out of framework scope.
 - **Test specification (unit):** ≥ 8 URL/path construction and payload passthrough
   cases (method + path per operation).
 - **Depends on:** T2.1.
@@ -724,28 +763,35 @@ Task ID format: `T<phase>.<n>`.
     unchanged.
 - **Depends on:** T0.1, T0.2.
 
-#### T3.3 — Async retry dedup guard (interaction idempotency)
+#### T3.3 — Duplicate-delivery guard (in-process, completion-marker semantics)
 
-- **Goal:** AWS async invokes retry on failure; Discord tokens are one-shot. Give worker
-  Lambdas a standard guard so a retried invoke doesn't double-PATCH or double-act —
-  the serverless analogue of frameworks' single-dispatch guarantee.
+- **Goal:** AWS async invoke is at-least-once — the same successful event can be
+  delivered twice. Give worker Lambdas a zero-dependency guard against re-executing
+  work that *already completed* on the same warm container. Per AD-9 this is a
+  **completion marker, not a claim**: it must never suppress a retry of a crashed
+  run (marking happens only after success), so crash recovery keeps working.
 - **Files:** `src/include/discord_interactions/idempotency.hpp`,
   `tests/unit/cpp/test_idempotency.cpp`, CLAUDE.md guidance section.
-- **Specification (deliberately storage-free):** in-process LRU of interaction ids
-  (warm container catches same-payload retries):
+- **Specification (deliberately storage-free):** in-process LRU of *completed*
+  interaction ids:
   ```cpp
-  class SeenInteractions {           // fixed capacity, default 128
+  class CompletedInteractions {      // fixed capacity, default 128
   public:
-    explicit SeenInteractions(size_t capacity = 128);
-    bool seen_before(const std::string& interaction_id);  // false first time, true after; LRU evict
+    explicit CompletedInteractions(size_t capacity = 128);
+    bool was_completed(const std::string& interaction_id) const;  // check BEFORE acting
+    void mark_completed(const std::string& interaction_id);       // call ONLY AFTER the
+                                                                  // PATCH succeeded; LRU evict
   };
   ```
-  Document explicitly in CLAUDE.md that the in-process guard only covers warm-container
-  retries; cross-container dedup is the opt-in Phase 5 DynamoDB claim (T5.2). Do **not**
-  wire it into router Lambdas in this task (workers own the decision).
-- **Test specification:** ≥ 8 cases: first-seen false; second-seen true; eviction at
-  capacity; eviction order (LRU not FIFO — re-seeing refreshes); capacity 1 edge;
-  empty id handled.
+  Usage contract (goes in the header comment and CLAUDE.md): check → act → PATCH →
+  mark. Never mark before the user-visible effect has happened. Scope honestly: this
+  catches same-container duplicates only (retries minutes later often land on a cold
+  container); durable cross-container dedup is Phase 5. Do **not** wire it into
+  router Lambdas in this task (workers own the decision).
+- **Test specification:** ≥ 8 cases: unmarked id → `was_completed` false; marked →
+  true; not marked on check alone (checking has no side effect); eviction at
+  capacity; eviction order (LRU — re-marking refreshes); capacity 1 edge; empty id
+  handled.
 - **Depends on:** T0.1.
 
 #### T3.4 — Friendly unknown-route replies
@@ -881,24 +927,31 @@ Task ID format: `T<phase>.<n>`.
 
 ### Phase 5 — Storage-backed interaction dedup (opt-in)
 
-**Rationale:** AWS async invocation retries can re-run a worker on a *different*
-container, which T3.3's in-process LRU cannot catch. This phase gives workers an
-opt-in, framework-owned DynamoDB claim so a retried invoke never double-PATCHes or
-double-executes a side effect — the serverless equivalent of other frameworks'
-single-dispatch guarantee, made durable.
+**Rationale:** AWS async invocation duplicates and retries can re-run a worker on a
+*different* container, which T3.3's in-process guard cannot catch. This phase makes
+the guard durable via DynamoDB — but per AD-9 the semantics matter more than the
+storage: a naive claim-at-start would suppress crash recovery and strand users on
+"thinking…".
 
 **Design decisions (fixed, do not re-litigate in-task):**
 
-- Claim = DynamoDB conditional `PutItem` with `attribute_not_exists(interaction_id)`
-  and a TTL attribute. First writer wins; a retry hits
-  `ConditionalCheckFailedException` and skips.
-- **Fail-open:** on any DynamoDB/infra error, log to stderr and proceed. A duplicate
-  Discord PATCH is strictly better than a silently dropped interaction.
-- Opt-in per worker via env `DISCORD_IDEMPOTENCY_TABLE`; unset → claim is a no-op
-  that always returns "proceed".
+- **Two primitives with different guarantees; the completion marker is the default.**
+
+  | Primitive | Mechanism | Guarantees | Use when |
+  |---|---|---|---|
+  | Completion marker (default) | `GetItem` check before acting; unconditional `PutItem` **after** the PATCH succeeds | User always gets a response (crash retries re-run); duplicate execution possible only in the crash-after-PATCH window or truly simultaneous deliveries | Side effects are idempotent or harmless to repeat (most commands: PATCH overwrites identically) |
+  | Claim (opt-in) | Conditional `PutItem` `attribute_not_exists(interaction_id)` **before** acting; retry hits `ConditionalCheckFailedException` and skips | At-most-once execution; a crash after claiming means the retry is suppressed and the user may get **no response** | Side effect must never run twice (currency, purchases, irreversible external commands) — dropped response is the lesser evil |
+
+- **Fail-open:** on any DynamoDB/infra error, both primitives log to stderr and
+  proceed. A duplicate Discord PATCH is strictly better than a silently dropped
+  interaction.
+- Opt-in per worker via env `DISCORD_IDEMPOTENCY_TABLE`; unset → both primitives
+  no-op to "proceed".
 - TTL default 3600 s (interaction tokens expire at 15 min; 1 h leaves audit slack).
 - Local testing reuses the existing endpoint-override pattern: new optional env
   `AWS_DYNAMODB_ENDPOINT`, mirroring `AWS_LAMBDA_ENDPOINT`.
+- Cold-start note: workers adopting this construct the DynamoDB client once as a
+  warm global (same pattern as the LambdaClient), never per-invoke.
 
 #### T5.1 — Builder image: add the DynamoDB client
 
@@ -916,9 +969,10 @@ single-dispatch guarantee, made durable.
   the commit body.
 - **Depends on:** nothing (parallel-safe from Wave 1).
 
-#### T5.2 — Idempotency claim helper (`idempotency_store.hpp`)
+#### T5.2 — Durable idempotency primitives (`idempotency_store.hpp`)
 
-- **Goal:** The claim primitive workers call before acting.
+- **Goal:** The completion-marker and claim primitives per the Phase 5 decision
+  table (AD-9).
 - **Files:** `src/include/discord_interactions/idempotency_store.hpp`,
   `tests/unit/cpp/test_idempotency_store.cpp` (this test target may link the AWS SDK
   DynamoDB lib — T0.1's escape hatch), root `infra/terraform`: optional
@@ -930,22 +984,38 @@ single-dispatch guarantee, made durable.
   ```cpp
   struct ClaimRequestParts { std::string table{}; json item{}; std::string condition{}; };
   // Pure, unit-testable: item = {interaction_id: {S: id}, expires_at: {N: now+ttl}};
-  // condition = "attribute_not_exists(interaction_id)".
+  // condition = "attribute_not_exists(interaction_id)" (empty for unconditional puts).
   ClaimRequestParts build_claim_request(const std::string& table,
                                         const std::string& interaction_id,
                                         int64_t now_epoch_s, int64_t ttl_s = 3600);
+  ClaimRequestParts build_completion_record(const std::string& table,
+                                            const std::string& interaction_id,
+                                            int64_t now_epoch_s, int64_t ttl_s = 3600);
   std::string idempotency_table_from_env();  // DISCORD_IDEMPOTENCY_TABLE or ""
-  // Executes the claim. Returns true = proceed (claimed, or table empty [opt-out],
-  // or infra error [fail-open, logged to stderr]); false = duplicate
-  // (ConditionalCheckFailedException only).
+
+  // Completion-marker primitive (DEFAULT — see Phase 5 decision table).
+  // was_completed: true only when a completion record exists; false on empty table
+  // (opt-out) or infra error (fail-open, logged).
+  bool was_completed(Aws::DynamoDB::DynamoDBClient& client, const std::string& table,
+                     const std::string& interaction_id);
+  // Call ONLY AFTER the user-visible effect (the PATCH) succeeded. Infra errors are
+  // logged and swallowed — failing to record must not fail the invocation.
+  void record_completion(Aws::DynamoDB::DynamoDBClient& client, const std::string& table,
+                         const std::string& interaction_id, int64_t now_epoch_s,
+                         int64_t ttl_s = 3600);
+
+  // Claim primitive (OPT-IN — at-most-once; may drop the response on crash).
+  // Returns true = proceed (claimed, or table empty [opt-out], or infra error
+  // [fail-open, logged]); false = duplicate (ConditionalCheckFailedException only).
   bool claim_interaction(Aws::DynamoDB::DynamoDBClient& client, const std::string& table,
                          const std::string& interaction_id, int64_t now_epoch_s,
                          int64_t ttl_s = 3600);
   ```
-- **Test specification (unit):** ≥ 8 cases on the pure parts: item shape (S/N types
-  as strings per DynamoDB JSON), TTL arithmetic, condition string, empty-table
-  no-op path, env helper set/unset/empty; the live-client branch is integration
-  territory (T5.3) — say so in the test file.
+- **Test specification (unit):** ≥ 10 cases on the pure parts: item shape (S/N types
+  as strings per DynamoDB JSON), TTL arithmetic, conditional vs unconditional
+  condition strings, completion record shape, empty-table no-op paths for all three
+  execution functions, env helper set/unset/empty; the live-client branches are
+  integration territory (T5.3) — say so in the test file.
 - **Depends on:** T0.1, T5.1.
 
 #### T5.3 — Integration coverage for dedup
@@ -953,18 +1023,27 @@ single-dispatch guarantee, made durable.
 - **Goal:** Prove end-to-end that a retried identical invoke produces exactly one
   user-visible PATCH.
 - **Files:** `tests/local/discord/mock_lambda_server.py` (minimal DynamoDB `PutItem`
-  endpoint routed on the `X-Amz-Target: DynamoDB_20120810.PutItem` header, honoring
-  `attribute_not_exists` conditions against an in-memory table),
+  + `GetItem` endpoints routed on the `X-Amz-Target: DynamoDB_20120810.*` header,
+  honoring `attribute_not_exists` conditions against an in-memory table),
   `tests/local/discord/run_local_tests.py` (new suite `dedup`),
-  `tests/local/discord/fixtures/discord-cmd-test-dedup/main.cpp` (worker fixture:
-  claim via `DISCORD_IDEMPOTENCY_TABLE` + `AWS_DYNAMODB_ENDPOINT`, then PATCH),
+  `tests/local/discord/fixtures/discord-cmd-test-dedup/main.cpp` (worker fixture
+  using the **completion-marker** flow: `was_completed` check → PATCH →
+  `record_completion`, via `DISCORD_IDEMPOTENCY_TABLE` + `AWS_DYNAMODB_ENDPOINT`;
+  an env flag `TEST_FAIL_BEFORE_PATCH=1` makes it exit after the check and before
+  the PATCH, to simulate a crash),
   `tests/unit/python/test_mock_dynamodb.py`, CLAUDE.md Local Testing + env tables
   (`AWS_DYNAMODB_ENDPOINT`).
 - **Test specification:** Python unit (write first): mock PutItem stores item; second
   conditional put returns `ConditionalCheckFailedException` error shape; unconditional
-  put overwrites; reset clears state. Integration: same interaction payload invoked
-  twice → exactly one Discord PATCH recorded; two distinct interaction ids → two
-  PATCHes; env unset → both invokes PATCH (opt-out honored).
+  put overwrites; GetItem hit/miss shapes; reset clears state. Integration:
+  1. *Duplicate success*: same interaction payload invoked twice → exactly one
+     Discord PATCH recorded.
+  2. *Crash recovery (the AD-9 case)*: first invoke with `TEST_FAIL_BEFORE_PATCH=1`
+     records nothing; second invoke of the same payload (the simulated retry, flag
+     off) → PATCH happens. A claim-at-start implementation fails this test —
+     that is the point of it.
+  3. Two distinct interaction ids → two PATCHes.
+  4. Env unset → both invokes PATCH (opt-out honored).
 - **Depends on:** T5.2, T2.3 (shares mock-server files — must run after it), T0.2.
 
 ---
