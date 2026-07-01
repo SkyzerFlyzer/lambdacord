@@ -267,7 +267,8 @@ Task ID format: `T<phase>.<n>`.
       embed_footer = 2048, embed_author = 256, embed_total = 6000, embeds_per_message = 10,
       action_rows = 5, buttons_per_row = 5, select_options = 25,
       autocomplete_choices = 25, choice_name = 100, custom_id = 100,
-      modal_title = 45, text_input_label = 45, text_input_value = 4000;
+      modal_title = 45, text_input_label = 45, text_input_value = 4000,
+      components_per_message = 40, text_display_content = 4000;
   }
   // UTF-8-safe truncation: never splits a multibyte sequence; appends "…" when cut.
   std::string safe_truncate(const std::string& text, size_t max_bytes);
@@ -349,21 +350,32 @@ Task ID format: `T<phase>.<n>`.
 - **API specification:**
   ```cpp
   enum class TextInputStyle { short_input = 1, paragraph = 2 };
-  json text_input(const std::string& custom_id, const std::string& label,
-                  TextInputStyle style, bool required = true,
-                  const std::string& placeholder = "", const std::string& value = "",
+  // Bare text input (type 4). Note: no label field — per current Discord docs,
+  // labels live on the Label wrapper; Action Row + Text Input in modals is
+  // DEPRECATED and must not be emitted by this header.
+  json text_input(const std::string& custom_id, TextInputStyle style,
+                  bool required = true, const std::string& placeholder = "",
+                  const std::string& value = "",
                   int min_length = 0, int max_length = 0 /*0 = omit*/);
+  // Label component (type 18) — the current wrapper for modal inputs.
+  json label_component(const std::string& label, const json& child,
+                       const std::string& description = "");
   json modal(const std::string& custom_id, const std::string& title,
-             std::initializer_list<json> text_inputs);  // wraps each input in a row;
-                                                        // throws ModuleError if >5
-  // Extraction from a MODAL_SUBMIT interaction:
+             std::initializer_list<json> components);
+      // components must be modal-legal top-level types (Label-wrapped inputs, or
+      // Text Display type 10); throws ModuleError(validation) on a bare text
+      // input (unwrapped) or on count > 40 (limits::components_per_message).
+  // Extraction from a MODAL_SUBMIT interaction (recurses through Label wrappers):
   std::optional<std::string> modal_value(const json& interaction, const std::string& custom_id);
   ```
   `modal(...)` returns the full `{type:9, data:{...}}` interaction response.
-- **Test specification:** ≥ 10 cases: input JSON shape per style; optional fields
-  omitted when defaulted; title/label clamped via limits; >5 inputs throws;
-  `modal_value` finds nested value, returns nullopt when absent; real-shaped
-  MODAL_SUBMIT fixture.
+- **Test specification:** ≥ 12 cases: input JSON shape per style; optional fields
+  omitted when defaulted; no `label` key on the text input itself; Label wrapper
+  shape with and without description; title/label clamped via limits; bare
+  text-input rejection; >40 components throws; no type-1 action rows anywhere in
+  the emitted modal; `modal_value` finds a value nested under a Label wrapper,
+  returns nullopt when absent; real-shaped MODAL_SUBMIT fixture using the
+  Label-wrapped structure.
 - **Depends on:** T0.1, T1.2.
 
 #### T1.6 — Snowflakes, mentions, timestamp formatting (`format.hpp`)
@@ -445,9 +457,8 @@ Task ID format: `T<phase>.<n>`.
   reference this surface is stable and documented (types 9–14, 17); it is not
   experimental.
 - **Files:** `src/include/discord_interactions/components_v2.hpp`,
-  `src/include/discord_interactions/limits.hpp` (add
-  `components_per_message = 40`, `text_display_content = 4000`),
-  `tests/unit/cpp/test_components_v2.cpp`.
+  `tests/unit/cpp/test_components_v2.cpp`. (The `components_per_message` and
+  `text_display_content` limits already land in T1.2.)
 - **API specification:**
   ```cpp
   inline constexpr int message_flag_components_v2 = 1 << 15;
@@ -519,6 +530,49 @@ Task ID format: `T<phase>.<n>`.
   marks it deprecated (grep-assert in test or via static_assert on the value).
 - **Depends on:** T0.1. (Standalone factory — deliberately does not extend T1.4's
   `ButtonStyle` enum, since premium buttons take `sku_id` instead of `custom_id`.)
+
+#### T1.11 — Modal input components (File Upload, Radio Group, Checkbox Group, Checkbox)
+
+- **Goal:** Complete the current modal input surface on top of T1.5's Label-based
+  modal structure: File Upload (19), Radio Group (21), Checkbox Group (22),
+  Checkbox (23), plus multi-value submit extraction.
+- **Files:** `src/include/discord_interactions/modal.hpp` (extend),
+  `tests/unit/cpp/test_modal_inputs.cpp`.
+- **API specification:**
+  ```cpp
+  json file_upload(const std::string& custom_id, bool required = true);   // type 19
+  json radio_option(const std::string& label, const std::string& value,
+                    const std::string& description = "", bool is_default = false);
+  json radio_group(const std::string& custom_id, const json& options /*array*/,
+                   bool required = true);                                 // type 21
+  json checkbox_group(const std::string& custom_id, const json& options /*array*/,
+                      bool required = true);                              // type 22
+  json checkbox(const std::string& custom_id, bool required = false);    // type 23;
+                                             // pair with label_component for its text
+  // MODAL_SUBMIT extraction (recurses through Label wrappers):
+  std::vector<std::string> modal_values(const json& interaction,
+                                        const std::string& custom_id);
+      // checkbox-group selections / file-upload attachment ids; empty if absent
+  std::optional<bool> modal_checked(const json& interaction,
+                                    const std::string& custom_id);        // checkbox
+  ```
+  All factories emit into Label wrappers via T1.5's `label_component`; custom_ids
+  clamp through `limits::custom_id`.
+- **Mandatory in-task verification:** the component reference
+  (docs.discord.com/developers/components/reference) confirms the type codes,
+  `custom_id`, and `required` fields, but this plan was written without visibility
+  into the exact option-object fields and MODAL_SUBMIT value shapes for these
+  components. Before the RED phase, the subagent must read the reference (and the
+  modal-submit payload examples) and confirm option fields (e.g. min/max values on
+  file upload) and submit shapes. If they differ from this API spec, follow the §8
+  escalation protocol: stop, report, plan gets amended first.
+- **Test specification:** ≥ 12 cases: exact type codes per factory; option object
+  shapes (as verified); required/default omission rules; radio group with a default
+  option; `modal_values` for a checkbox group (multi), file upload (attachment ids),
+  and absent custom_id (empty vector); `modal_checked` true/false/absent; extraction
+  through Label wrappers using a real-shaped MODAL_SUBMIT fixture; composition test —
+  a full `modal(...)` containing one of each input type stays ≤ 40 and validates.
+- **Depends on:** T0.1, T1.2, T1.5.
 
 ---
 
@@ -923,7 +977,7 @@ Wave 1 (parallel): T1.1  T1.2  T1.6  T1.10  T3.3  T5.1     (need only T0.1/T0.2 
 Wave 2 (parallel): T1.3  T1.4  T1.5  T1.7  T1.8    (need T1.2)   |  T2.1  |  T4.1  T4.2
 Wave 3 (parallel): T1.9  T2.2  T3.1  T3.2  T4.3  T5.2      (T1.9 needs T1.4; T2.2 needs
                                                             T2.1; T5.2 needs T5.1)
-Wave 4 (parallel): T2.3  T3.4  T4.4
+Wave 4 (parallel): T1.11  T2.3  T3.4  T4.4          (T1.11 needs T1.5)
 Wave 5 (serial):   T5.3                                     (after T2.3 — shares the
                                                             mock-server files)
 Wave 6 (serial):   T4.5
@@ -1051,23 +1105,20 @@ tests/unit/cpp/CMakeLists.txt — add your test file to it).
    `scripts/build-all-lambdas.sh && scripts/test-local-discord-lambdas.sh` and fix
    regressions before proceeding.
 6. Out of scope, do not accept scope creep from subagents: gateway/websocket features,
-   voice, sharding, message-content intents, OAuth flows, and the modal-only new
-   component types (Label 18, File Upload 19, Radio Group 21, Checkbox Group 22,
-   Checkbox 23 — they layer on T1.5 + T1.9 and are deferred) — record as future work
+   voice, sharding, message-content intents, OAuth flows — record as future work
    instead.
 
 ## 9. Future work (explicitly deferred)
 
 Each entry carries its reason; "deferred" means considered and consciously excluded,
-not forgotten. (Components V2, entitlements/premium, and storage-backed dedup were
-originally listed here and have been promoted to tasks T1.9, T1.10, and Phase 5.)
+not forgotten. (Components V2, entitlements/premium, storage-backed dedup, and the
+modal input components were originally listed here and have been promoted to tasks
+T1.9, T1.10, Phase 5, and T1.11.)
 
 - Attachment/file upload support in webhook messages — requires multipart/form-data
   in the curl layer, a materially different code path from T2.x; spec it as its own
-  phase when needed.
-- Modal-only new component types (Label 18, File Upload 19, Radio Group 21,
-  Checkbox Group 22, Checkbox 23) — layer cleanly on T1.5 + T1.9 once both have
-  landed; adding them now would couple two otherwise-independent tasks.
+  phase when needed. (Distinct from T1.11's modal File Upload component, which only
+  references attachments the client already uploaded.)
 - Localized runtime replies (framework-level copy catalogue) — T4.1 validates schema
   localizations; localizing runtime copy needs a locale-selection design first.
 - CI-side integration harness — needs arm64 runners or x86_64 RIE builds; runner
