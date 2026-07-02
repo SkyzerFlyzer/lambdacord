@@ -201,3 +201,27 @@ resource "terraform_data" "discord_interactions_function_url_invoke_permission" 
     aws_lambda_function_url.discord_interactions,
   ]
 }
+
+# Optional durable interaction-dedup table (Phase 5 / AD-9). Disabled by default;
+# worker Lambdas opt in via the DISCORD_IDEMPOTENCY_TABLE env var. On-demand
+# billing, a single string hash key, and a TTL attribute so DynamoDB expires old
+# completion/claim records automatically.
+resource "aws_dynamodb_table" "discord_idempotency" {
+  count = var.discord_idempotency_table_enabled ? 1 : 0
+
+  name         = "${var.project_name}-discord-idempotency"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "interaction_id"
+
+  attribute {
+    name = "interaction_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+
+  tags = local.common_tags
+}

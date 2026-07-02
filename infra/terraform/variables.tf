@@ -57,6 +57,12 @@ variable "worker_lambda_timeout" {
   default     = 30
 }
 
+variable "discord_idempotency_table_enabled" {
+  description = "Create the optional DynamoDB table backing durable interaction dedup (Phase 5 / AD-9). When false (default) no table is created and the table outputs are null/empty."
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Tags applied to supported resources."
   type        = map(string)

@@ -156,6 +156,7 @@ should see it, PATCH `@original`.
 |---|---|---|
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (local testing) |
+| `DISCORD_IDEMPOTENCY_TABLE` | No | DynamoDB table name for durable cross-container interaction dedup (Phase 5 / AD-9). Unset or empty ⇒ both `idempotency_store.hpp` primitives no-op to "proceed". Opt-in per worker Lambda; provision the table via the root `discord_idempotency_table_enabled` Terraform variable. |
 
 ### Discord REST helpers
 
@@ -268,3 +269,31 @@ eviction (re-marking an id refreshes its recency).
   retries minutes later often land on a cold container with an empty guard.
   Durable cross-container dedup is the Phase 5 DynamoDB primitives. Do not wire
   this into router Lambdas — workers own the decision.
+
+Durable (cross-container) dedup lives in
+`src/include/discord_interactions/idempotency_store.hpp` (with pure request
+shaping split into `idempotency_requests.hpp`). It is DynamoDB-backed and
+gated on `DISCORD_IDEMPOTENCY_TABLE`: an empty table name makes every primitive
+a no-op that returns "proceed", and any DynamoDB/infra error is **fail-open**
+(logged to stderr, then proceed) — a duplicate PATCH beats a silently dropped
+interaction. Two primitives, per AD-9:
+
+- **Completion marker (DEFAULT):** `was_completed(client, table, id)` (GetItem)
+  → act → PATCH → `record_completion(client, table, id, now_epoch_s)`
+  (unconditional PutItem, **only after** the PATCH). A retry of a run that
+  crashed before the PATCH finds no record and re-runs, so the user always gets
+  a response; duplicates of a success skip. Use this unless a side effect must
+  not repeat.
+- **Claim (OPT-IN):** `claim_interaction(client, table, id, now_epoch_s)`
+  (conditional PutItem `attribute_not_exists(interaction_id)`) **before** acting;
+  returns `false` only on `ConditionalCheckFailedException`. Guarantees
+  at-most-once, but a crash after the claim suppresses the retry and the user may
+  get **no** response. Reserve it for non-idempotent side effects (currency,
+  purchases, irreversible external commands) where a dropped response is the
+  lesser evil.
+
+Construct the `Aws::DynamoDB::DynamoDBClient` **once as a warm global** in
+`main()` (same pattern as `lambda_client.hpp`), never per invocation; point it at
+`AWS_DYNAMODB_ENDPOINT` for local testing. TTL defaults to 3600 s (interaction
+tokens expire at 15 min; 1 h leaves audit slack), and the `expires_at` attribute
+lets DynamoDB expire records automatically.
