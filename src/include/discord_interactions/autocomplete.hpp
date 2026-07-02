@@ -33,6 +33,28 @@ namespace autocomplete_detail {
 inline constexpr int sub_command = 1;
 inline constexpr int sub_command_group = 2;
 
+// UTF-8-safe, no-ellipsis clamp for machine-facing choice values.
+//
+// Distinct from limits.hpp's safe_truncate, which appends an ellipsis: a string
+// choice value is an identifier the client sends back verbatim on selection, so
+// an appended "…" would corrupt it. This clamps to at most `max_bytes`,
+// retreating to a UTF-8 codepoint boundary so a multibyte sequence is never
+// split, and appends nothing.
+inline std::string clamp_value_no_ellipsis(const std::string& text,
+                                           std::size_t max_bytes) {
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+    std::size_t keep = max_bytes;
+    // Continuation bytes match 10xxxxxx (0x80..0xBF); retreat off any partial
+    // multibyte sequence so the cut lands on a codepoint boundary.
+    while (keep > 0 &&
+           (static_cast<unsigned char>(text[keep]) & 0xC0) == 0x80) {
+        --keep;
+    }
+    return text.substr(0, keep);
+}
+
 // ASCII-lowercase copy for case-insensitive comparison. Autocomplete queries
 // are short user input; a byte-wise lowercase is sufficient for the common
 // ASCII case and never throws on multibyte input (bytes >= 0x80 are unchanged).
@@ -108,9 +130,13 @@ inline json choice(const std::string& name, double value) {
 }
 
 // Wraps a choices array into an autocomplete response: keeps only the first
-// limits::autocomplete_choices (25) entries and truncates each choice name to
-// limits::choice_name (100) via safe_truncate. Returns
-// {type:8, data:{choices:[...]}}.
+// limits::autocomplete_choices (25) entries, truncates each choice name to
+// limits::choice_name (100) via safe_truncate, and clamps each string choice
+// VALUE to Discord's 100-byte value limit. String values are machine-facing
+// identifiers echoed back verbatim on selection, so they are clamped WITHOUT an
+// ellipsis (see clamp_value_no_ellipsis) — an appended "…" would corrupt the
+// identifier. The 100-byte value cap equals limits::choice_name. Non-string
+// (int/double) values are left untouched. Returns {type:8, data:{choices:[...]}}.
 inline json autocomplete_response(const json& choices) {
     json out = json::array();
     if (choices.is_array()) {
@@ -123,6 +149,11 @@ inline json autocomplete_response(const json& choices) {
                 entry.at("name").is_string()) {
                 entry["name"] =
                     safe_truncate(entry.at("name").get<std::string>(), limits::choice_name);
+            }
+            if (entry.is_object() && entry.contains("value") &&
+                entry.at("value").is_string()) {
+                entry["value"] = autocomplete_detail::clamp_value_no_ellipsis(
+                    entry.at("value").get<std::string>(), limits::choice_name);
             }
             out.push_back(std::move(entry));
         }

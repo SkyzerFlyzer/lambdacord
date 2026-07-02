@@ -108,6 +108,52 @@ TEST_CASE("autocomplete_response truncates names to 100 chars") {
     CHECK(out.size() < long_name.size());
 }
 
+TEST_CASE("autocomplete_response passes a 100-char string value through unchanged") {
+    const std::string value(100, 'v');
+    json choices = json::array({di::choice("name", value)});
+    const json resp = di::autocomplete_response(choices);
+    const std::string out = resp.at("data").at("choices").at(0).at("value");
+    CHECK(out == value);
+    CHECK(out.size() == 100);
+}
+
+TEST_CASE("autocomplete_response clamps an oversized ASCII string value to 100 bytes with no ellipsis") {
+    const std::string value(300, 'v');
+    json choices = json::array({di::choice("name", value)});
+    const json resp = di::autocomplete_response(choices);
+    const std::string out = resp.at("data").at("choices").at(0).at("value");
+    CHECK(out.size() == 100);
+    // Machine-facing identifier: no ellipsis appended.
+    CHECK(out == std::string(100, 'v'));
+}
+
+TEST_CASE("autocomplete_response clamps a multibyte string value on a codepoint boundary") {
+    // 99 ASCII bytes then a 2-byte é (U+00E9): the byte at index 100 would land
+    // mid-sequence, so the cut must retreat to 99 bytes to stay valid UTF-8.
+    std::string value(99, 'a');
+    value += "\xC3\xA9";  // é, 2 bytes -> total 101 bytes
+    value += "tail";
+    json choices = json::array({di::choice("name", value)});
+    const json resp = di::autocomplete_response(choices);
+    const std::string out = resp.at("data").at("choices").at(0).at("value");
+    CHECK(out.size() <= 100);
+    // Never split the multibyte sequence: the trailing é must be dropped whole.
+    CHECK(out == std::string(99, 'a'));
+    // The result must be valid UTF-8 (nlohmann::json only serializes valid UTF-8).
+    CHECK_NOTHROW(json({{"v", out}}).dump());
+}
+
+TEST_CASE("autocomplete_response leaves numeric choice values untouched") {
+    json choices = json::array(
+        {di::choice("i", int64_t(123456789)), di::choice("d", 0.5)});
+    const json resp = di::autocomplete_response(choices);
+    const json& out = resp.at("data").at("choices");
+    CHECK(out.at(0).at("value") == 123456789);
+    CHECK(out.at(0).at("value").is_number_integer());
+    CHECK(out.at(1).at("value").get<double>() == doctest::Approx(0.5));
+    CHECK(out.at(1).at("value").is_number_float());
+}
+
 TEST_CASE("filter_choices empty query returns all unchanged") {
     json choices = json::array(
         {di::choice("Banana", std::string("b")), di::choice("Apple", std::string("a"))});

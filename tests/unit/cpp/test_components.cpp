@@ -104,6 +104,29 @@ TEST_CASE("select_option shape and default omission") {
     CHECK(full["default"] == true);
 }
 
+TEST_CASE("string_select allows exactly 25 options") {
+    json options = json::array();
+    for (int i = 0; i < 25; ++i) {
+        options.push_back(select_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    const json s = string_select("pick", options);
+    CHECK(s["options"].size() == 25);
+}
+
+TEST_CASE("string_select throws too_many_select_options past 25 options") {
+    json options = json::array();
+    for (int i = 0; i < 26; ++i) {
+        options.push_back(select_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    try {
+        string_select("pick", options);
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.code == "too_many_select_options");
+        CHECK(e.category == ErrorCategory::validation);
+    }
+}
+
 TEST_CASE("user_select emits type 5") {
     const json s = user_select("owner", "Pick a user");
     CHECK(s["type"] == 5);
@@ -153,6 +176,28 @@ TEST_CASE("action_row allows a single select") {
     const json row = action_row(comps);
     CHECK(row["type"] == 1);
     CHECK(row["components"].size() == 1);
+}
+
+TEST_CASE("action_row throws mixed_row_components on a select plus a button") {
+    const json comps = json::array({string_select("pick", json::array()),
+                                    button(ButtonStyle::primary, "b", "B")});
+    try {
+        action_row(comps);
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.code == "mixed_row_components");
+        CHECK(e.category == ErrorCategory::validation);
+    }
+}
+
+TEST_CASE("action_row allows five buttons without a select") {
+    json comps = json::array();
+    for (int i = 0; i < 5; ++i) {
+        comps.push_back(button(ButtonStyle::primary, "b" + std::to_string(i), "B"));
+    }
+    const json row = action_row(comps);
+    CHECK(row["type"] == 1);
+    CHECK(row["components"].size() == 5);
 }
 
 TEST_CASE("action_row throws too_many_components on six buttons") {

@@ -79,9 +79,17 @@ inline json select_option(const std::string& label, const std::string& value,
 
 // A string select menu (component type 3). `placeholder`/`min_values`/
 // `max_values`/`disabled` are emitted only when non-default (min/max default 1).
+// Throws ModuleError(code="too_many_select_options", category=validation) when
+// `options` holds more than limits::select_options (25) entries, since Discord
+// rejects such payloads.
 inline json string_select(const std::string& custom_id, const json& options,
                           const std::string& placeholder = "", int min_values = 1,
                           int max_values = 1, bool disabled = false) {
+    if (options.is_array() && options.size() > limits::select_options) {
+        throw MODULE_ERROR("too_many_select_options", ErrorCategory::validation,
+                           "string select holds more than " +
+                               std::to_string(limits::select_options) + " options");
+    }
     json result = json::object();
     result["type"] = 3;
     result["custom_id"] = safe_truncate(custom_id, limits::custom_id);
@@ -142,9 +150,12 @@ inline json channel_select(const std::string& custom_id,
     return result;
 }
 
-// Wraps components in an action row (component type 1). Throws
-// ModuleError(code="too_many_components", category=validation) if the row holds
-// more than limits::buttons_per_row buttons or more than one select menu.
+// Wraps components in an action row (component type 1). A Discord action row may
+// hold EITHER up to limits::buttons_per_row buttons OR exactly one select menu,
+// never a mix of the two. Throws
+// ModuleError(code="too_many_components", category=validation) past those counts,
+// and ModuleError(code="mixed_row_components", category=validation) when the row
+// mixes at least one select with at least one button.
 inline json action_row(const json& components) {
     std::size_t buttons = 0;
     std::size_t selects = 0;
@@ -164,6 +175,10 @@ inline json action_row(const json& components) {
     if (selects > 1) {
         throw MODULE_ERROR("too_many_components", ErrorCategory::validation,
                            "action row holds more than one select menu");
+    }
+    if (selects >= 1 && buttons >= 1) {
+        throw MODULE_ERROR("mixed_row_components", ErrorCategory::validation,
+                           "action row mixes a select menu with buttons");
     }
     json result = json::object();
     result["type"] = 1;
