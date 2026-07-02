@@ -107,6 +107,8 @@ changing module code.
 
 **Naming convention is load-bearing:** the application-command handler derives the Lambda name mechanically from the command path (`<group> <subcommand>` → `discord-cmd-<group>-<subcommand>`). The name must match exactly.
 
+Context menu commands (interaction `data.type` 2 = user, 3 = message) follow the same mechanical rule on the raw command name: ASCII letters lowercased, spaces → `-` (`"Report User"` → `discord-usercmd-report-user`; message commands → `discord-msgcmd-<name>`). Module manifests declare them under the `user_commands` / `message_commands` route kinds; the handler consults the optional `DISCORD_USER_COMMAND_ROUTES` / `DISCORD_MESSAGE_COMMAND_ROUTES` env route maps (JSON objects keyed by the raw command name, mirroring `DISCORD_COMMAND_ROUTES`) before falling back to the mechanical derivation.
+
 ---
 
 ## Interaction Routing
@@ -116,7 +118,9 @@ Discord HTTP POST
   └─► discord-interactions          (verify sig, dispatch by type)
         ├─ type 1 (PING)            → respond {type:1} inline
         ├─ type 2 (APPLICATION_CMD) → async ► discord-application-command-handler
-        │                                         └─► discord-cmd-<path>
+        │                                         ├─ data.type 1/absent (slash)   ─► discord-cmd-<path>
+        │                                         ├─ data.type 2 (user ctx menu)  ─► discord-usercmd-<name>
+        │                                         └─ data.type 3 (msg ctx menu)   ─► discord-msgcmd-<name>
         ├─ type 3 (MESSAGE_COMP)    → async ► discord-message-component-handler
         │                                         └─► discord-component-<prefix>
         ├─ type 4 (AUTOCOMPLETE)    → sync  ► discord-autocomplete-handler

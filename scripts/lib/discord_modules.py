@@ -27,6 +27,18 @@ _CMD_MESSAGE = 3
 _OPT_SUBCOMMAND = 1
 _OPT_SUBCOMMAND_GROUP = 2
 
+# Manifest route-kind vocabulary. `user_commands` / `message_commands` are the
+# context menu kinds (T3.1); `route_map` works for every kind listed here and
+# manifest validation type-checks each kind's mapping.
+ROUTE_KINDS = (
+    "commands",
+    "components",
+    "modals",
+    "autocomplete",
+    "user_commands",
+    "message_commands",
+)
+
 
 def read_json(path: Path):
     try:
@@ -586,14 +598,7 @@ def check_route_consistency(modules):
         # Orphan Lambda folders -> warning. A folder is referenced if any route
         # kind targets it, or the error mapper points at it.
         referenced = set()
-        for route_kind in (
-            "commands",
-            "components",
-            "modals",
-            "autocomplete",
-            "user_commands",
-            "message_commands",
-        ):
+        for route_kind in ROUTE_KINDS:
             referenced.update(filter(None, _route_targets(routes.get(route_kind, {})).values()))
         error_mapper = manifest.get("error_mapper", {})
         if isinstance(error_mapper, dict):
@@ -624,7 +629,7 @@ def validate_module_manifests(repo_root: Path):
             if not (lambda_dir / "main.cpp").exists():
                 problems.append(f"{manifest['name']} lambda missing main.cpp: {lambda_dir}")
 
-        for route_kind in ("commands", "components", "modals", "autocomplete"):
+        for route_kind in ROUTE_KINDS:
             mapping = routes.get(route_kind, {})
             if not isinstance(mapping, dict):
                 problems.append(f"{module['manifest_path']} routes.{route_kind} must be an object")

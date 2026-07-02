@@ -418,6 +418,18 @@ def run_application_command_tests():
         "DISCORD_COMMAND_ROUTES": json.dumps(
             {**route_map(REPO_ROOT, "commands"), "ping": "discord-cmd-example-ping"}
         ),
+        # Context menu route maps (T3.1): installed-module routes plus a fixed
+        # test entry so the override path stays testable on a clean framework
+        # checkout, mirroring DISCORD_COMMAND_ROUTES above.
+        "DISCORD_USER_COMMAND_ROUTES": json.dumps(
+            {
+                **route_map(REPO_ROOT, "user_commands"),
+                "Block User": "discord-usercmd-example-block",
+            }
+        ),
+        "DISCORD_MESSAGE_COMMAND_ROUTES": json.dumps(
+            route_map(REPO_ROOT, "message_commands")
+        ),
     }
     with LambdaContainer("discord-application-command-handler.zip", env) as container:
         payload = {
@@ -542,6 +554,41 @@ def run_application_command_tests():
         assert_equal(status, 200, "example ping application handler HTTP status")
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-cmd-example-ping", "example ping route")
+
+        # Context menu commands (T3.1): data.type 2 (user) and 3 (message)
+        # route mechanically to discord-usercmd-<suffix> / discord-msgcmd-<suffix>.
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 2, "name": "Report User"}}
+        )
+        assert_equal(status, 200, "user context menu HTTP status")
+        assert_equal(
+            parse_json(text, "user context menu success")["ok"],
+            True,
+            "user context menu success payload",
+        )
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-usercmd-report-user", "user context menu route")
+        assert_equal(logs[0]["invocation_type"], "Event", "user context menu invocation type")
+
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 3, "name": "Pin Message"}}
+        )
+        assert_equal(status, 200, "message context menu HTTP status")
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-msgcmd-pin-message", "message context menu route")
+        assert_equal(logs[0]["invocation_type"], "Event", "message context menu invocation type")
+
+        # A DISCORD_USER_COMMAND_ROUTES entry (keyed by the raw command name)
+        # wins over mechanical derivation, mirroring DISCORD_COMMAND_ROUTES.
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 2, "name": "Block User"}}
+        )
+        assert_equal(status, 200, "mapped user context menu HTTP status")
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-usercmd-example-block", "mapped user context menu route")
 
         reset_mock()
         status, text = container.invoke({"type": 2, "data": {}})
