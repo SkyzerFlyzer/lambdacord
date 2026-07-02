@@ -23,6 +23,7 @@
 #include <initializer_list>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "discord_interactions/errors.hpp"
 #include "discord_interactions/limits.hpp"
@@ -79,6 +80,95 @@ inline json label_component(const std::string& label, const json& child,
     }
     wrapper["component"] = child;
     return wrapper;
+}
+
+// ---------------------------------------------------------------------------
+// Additional modal input components. Per the Discord component reference all of
+// these are bare inputs that MUST be placed inside a Label wrapper (type 18) via
+// label_component(); modal() therefore still only accepts Label / Text Display
+// at the top level. custom_ids clamp to limits::custom_id, and every optional
+// field is omitted when left at its default so payloads stay minimal.
+// ---------------------------------------------------------------------------
+
+// File Upload (component type 19). On MODAL_SUBMIT the uploaded files arrive as
+// an "attachment_ids" array of snowflakes (extract with modal_values).
+inline json file_upload(const std::string& custom_id, bool required = true) {
+    json input = json::object();
+    input["type"] = 19;
+    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["required"] = required;
+    return input;
+}
+
+// A single option for a Radio Group or Checkbox Group. label/value/description
+// each clamp to Discord's 100-char option limit; description is omitted when
+// empty and the "default" key is emitted only when is_default is true.
+inline json radio_option(const std::string& label, const std::string& value,
+                         const std::string& description = "",
+                         bool is_default = false) {
+    json option = json::object();
+    option["label"] = safe_truncate(label, limits::choice_name);
+    option["value"] = safe_truncate(value, limits::choice_name);
+    if (!description.empty()) {
+        option["description"] = safe_truncate(description, limits::choice_name);
+    }
+    if (is_default) {
+        option["default"] = true;
+    }
+    return option;
+}
+
+// Radio Group (component type 21) — a single-choice list. On MODAL_SUBMIT the
+// chosen option's value arrives as a string "value".
+inline json radio_group(const std::string& custom_id, const json& options,
+                        bool required = true) {
+    json input = json::object();
+    input["type"] = 21;
+    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["options"] = options.is_array() ? options : json::array();
+    input["required"] = required;
+    return input;
+}
+
+// Checkbox Group (component type 22) — a multi-choice list. On MODAL_SUBMIT the
+// selected option values arrive as a "values" array (extract with modal_values).
+// min_values / max_values are ADDITIVE optional fields the component reference
+// documents (0..25) that the T1.11 plan spec omitted; they are emitted only when
+// set to a non-negative value.
+inline json checkbox_group(const std::string& custom_id, const json& options,
+                           bool required = true, int min_values = -1,
+                           int max_values = -1) {
+    json input = json::object();
+    input["type"] = 22;
+    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["options"] = options.is_array() ? options : json::array();
+    input["required"] = required;
+    if (min_values >= 0) {
+        input["min_values"] = min_values;
+    }
+    if (max_values >= 0) {
+        input["max_values"] = max_values;
+    }
+    return input;
+}
+
+// Checkbox (component type 23) — a single boolean checkbox. Its visible text is
+// supplied by the enclosing Label wrapper (pair with label_component), so the
+// input carries no "label" of its own. required defaults to false here (the
+// framework default; Discord's own default is true). "default" (the initial
+// checked state) is an ADDITIVE optional field from the component reference,
+// emitted only when is_default is true. On MODAL_SUBMIT the state arrives as a
+// boolean "value" (extract with modal_checked).
+inline json checkbox(const std::string& custom_id, bool required = false,
+                     bool is_default = false) {
+    json input = json::object();
+    input["type"] = 23;
+    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["required"] = required;
+    if (is_default) {
+        input["default"] = true;
+    }
+    return input;
 }
 
 // Builds a full MODAL interaction response ({type:9, data:{...}}). Components
@@ -155,6 +245,67 @@ inline std::optional<std::string> find_modal_value(const json& node,
     return std::nullopt;
 }
 
+// Depth-first collection of the string elements of a submitted component's
+// multi-value field (checkbox-group "values" or file-upload "attachment_ids").
+// Recurses through Label wrappers and nested arrays; stops at the first object
+// whose "custom_id" matches (custom_ids are unique within a modal).
+inline void collect_modal_values(const json& node, const std::string& custom_id,
+                                 std::vector<std::string>& out) {
+    if (node.is_object()) {
+        const auto id_it = node.find("custom_id");
+        if (id_it != node.end() && id_it->is_string() &&
+            id_it->get<std::string>() == custom_id) {
+            for (const char* key : {"values", "attachment_ids"}) {
+                const auto arr_it = node.find(key);
+                if (arr_it != node.end() && arr_it->is_array()) {
+                    for (const auto& element : *arr_it) {
+                        if (element.is_string()) {
+                            out.push_back(element.get<std::string>());
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        for (const auto& child : node.items()) {
+            collect_modal_values(child.value(), custom_id, out);
+        }
+    } else if (node.is_array()) {
+        for (const auto& child : node) {
+            collect_modal_values(child, custom_id, out);
+        }
+    }
+}
+
+// Depth-first search for an object whose "custom_id" equals target and which
+// carries a boolean "value" (a Checkbox). Recurses through Label wrappers.
+inline std::optional<bool> find_modal_checked(const json& node,
+                                              const std::string& custom_id) {
+    if (node.is_object()) {
+        const auto id_it = node.find("custom_id");
+        const auto value_it = node.find("value");
+        if (id_it != node.end() && id_it->is_string() &&
+            id_it->get<std::string>() == custom_id && value_it != node.end() &&
+            value_it->is_boolean()) {
+            return value_it->get<bool>();
+        }
+        for (const auto& child : node.items()) {
+            auto found = find_modal_checked(child.value(), custom_id);
+            if (found.has_value()) {
+                return found;
+            }
+        }
+    } else if (node.is_array()) {
+        for (const auto& child : node) {
+            auto found = find_modal_checked(child, custom_id);
+            if (found.has_value()) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace detail
 
 // Extracts a submitted text value from a MODAL_SUBMIT interaction by custom_id,
@@ -174,6 +325,48 @@ inline std::optional<std::string> modal_value(const json& interaction,
         return std::nullopt;
     }
     return detail::find_modal_value(*components_it, custom_id);
+}
+
+// Extracts a submitted multi-value field from a MODAL_SUBMIT interaction by
+// custom_id, recursing through Label wrappers. Returns the selected values of a
+// Checkbox Group ("values") or the uploaded attachment ids of a File Upload
+// ("attachment_ids"). Returns an empty vector when the input is absent or has no
+// such array.
+inline std::vector<std::string> modal_values(const json& interaction,
+                                             const std::string& custom_id) {
+    std::vector<std::string> out{};
+    if (!interaction.is_object()) {
+        return out;
+    }
+    const auto data_it = interaction.find("data");
+    if (data_it == interaction.end() || !data_it->is_object()) {
+        return out;
+    }
+    const auto components_it = data_it->find("components");
+    if (components_it == data_it->end()) {
+        return out;
+    }
+    detail::collect_modal_values(*components_it, custom_id, out);
+    return out;
+}
+
+// Extracts a submitted Checkbox state from a MODAL_SUBMIT interaction by
+// custom_id, recursing through Label wrappers. Returns nullopt when the checkbox
+// is absent or carries no boolean value.
+inline std::optional<bool> modal_checked(const json& interaction,
+                                         const std::string& custom_id) {
+    if (!interaction.is_object()) {
+        return std::nullopt;
+    }
+    const auto data_it = interaction.find("data");
+    if (data_it == interaction.end() || !data_it->is_object()) {
+        return std::nullopt;
+    }
+    const auto components_it = data_it->find("components");
+    if (components_it == data_it->end()) {
+        return std::nullopt;
+    }
+    return detail::find_modal_checked(*components_it, custom_id);
 }
 
 }  // namespace discord_interactions
