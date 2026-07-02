@@ -166,6 +166,8 @@ should see it, PATCH `@original`.
 
 ## Local Testing
 
+Fast Python unit tests (no Docker): `python3 -m pytest tests/unit/python` runs the Python unit layer for `scripts/lib`.
+
 Tests require Docker and Python 3. They spin up real Lambda containers via the AWS Lambda Runtime Interface Emulator (RIE) and a lightweight Python mock server that stands in for the Lambda control plane.
 
 ```bash
