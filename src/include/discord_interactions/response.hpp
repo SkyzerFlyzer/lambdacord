@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "discord_interactions/components.hpp"
+
 namespace discord_interactions {
 
 using json = nlohmann::json;
@@ -52,13 +54,12 @@ inline json ephemeral_message(const std::string& content) {
     return {{"content", content}, {"flags", ephemeral_flag}};
 }
 
+// A one-row action row holding a single link button. Refactored to delegate to
+// components.hpp (button() + action_row()); the emitted JSON shape is unchanged
+// so existing callers keep working byte-for-byte.
 inline json link_button_row(const std::string& label, const std::string& url) {
-    return json::array({{{"type", 1},
-                         {"components",
-                          json::array({{{"type", 2},
-                                        {"style", 5},
-                                        {"label", label},
-                                        {"url", url}}})}}});
+    return json::array(
+        {action_row(json::array({button(ButtonStyle::link, url, label)}))});
 }
 
 inline std::string discord_api_base_url() {
