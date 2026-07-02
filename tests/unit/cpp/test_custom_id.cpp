@@ -126,34 +126,29 @@ TEST_CASE("parse of a legacy paginator id \"p:3\" yields prefix p and arg 3") {
     CHECK(parsed.args[0] == "3");
 }
 
-// ---- Paginator regression: output must be byte-identical after the refactor ----
+// ---- Paginator custom_id wire-format regression (five-button row, T4.4) ----
+// The paginator shape changed from 2 buttons (Previous/Next) to 5
+// (first/prev/counter/next/last) in T4.4; full behavioral coverage lives in
+// test_paginator.cpp. These cases pin only that the wire format the custom_id
+// codec round-trips is unchanged: prev/next arithmetic still encode via
+// encode_custom_id(prefix, {"<page>"}).
 
-TEST_CASE("paginator_row output is byte-identical for a mid-page case") {
-    // page 2 of 5 (last_page = 4): Previous -> p:1 enabled, Next -> p:3 enabled.
-    const json expected = json::parse(R"([
-        {"type":1,"components":[
-            {"type":2,"style":2,"label":"Previous","custom_id":"p:1","disabled":false},
-            {"type":2,"style":2,"label":"Next","custom_id":"p:3","disabled":false}
-        ]}
-    ])");
-    const json actual = paginator_row("p", 2, 5);
-    CHECK(actual == expected);
-    // Byte-identical serialization (nlohmann sorts object keys deterministically).
-    CHECK(actual.dump() == expected.dump());
+TEST_CASE("paginator_row prev/next custom_ids use the encode_custom_id wire format") {
+    // page 2 of 5 (last_page = 4): prev -> p:1, next -> p:3.
+    const json row = paginator_row("p", 2, 5);
+    REQUIRE(row[0]["components"].size() == 5);
+    CHECK(row[0]["components"][1]["custom_id"] == "p:1");  // prev
+    CHECK(row[0]["components"][3]["custom_id"] == "p:3");  // next
 }
 
-TEST_CASE("paginator_row clamps at the first and last page") {
+TEST_CASE("paginator_row clamps prev/next custom_ids at the first and last page") {
     const json first = paginator_row("p", 0, 5);
-    CHECK(first[0]["components"][0]["disabled"] == true);   // Previous disabled
-    CHECK(first[0]["components"][0]["custom_id"] == "p:0");
-    CHECK(first[0]["components"][1]["disabled"] == false);  // Next enabled
-    CHECK(first[0]["components"][1]["custom_id"] == "p:1");
+    CHECK(first[0]["components"][1]["custom_id"] == "p:0");  // prev clamps to 0
+    CHECK(first[0]["components"][3]["custom_id"] == "p:1");  // next
 
     const json last = paginator_row("p", 4, 5);
-    CHECK(last[0]["components"][0]["disabled"] == false);   // Previous enabled
-    CHECK(last[0]["components"][0]["custom_id"] == "p:3");
-    CHECK(last[0]["components"][1]["disabled"] == true);    // Next disabled
-    CHECK(last[0]["components"][1]["custom_id"] == "p:4");
+    CHECK(last[0]["components"][1]["custom_id"] == "p:3");   // prev
+    CHECK(last[0]["components"][3]["custom_id"] == "p:4");   // next clamps to last
 }
 
 TEST_CASE("parse_page_after_prefix returns the page number unchanged") {
