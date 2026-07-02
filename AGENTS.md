@@ -195,12 +195,14 @@ than let the user hang on "thinking…"/"application did not respond", the
 routers reply cleanly:
 
 - The three **async** routers (application-command, message-component, modal)
-  PATCH `@original` with the shared ephemeral copy
+  PATCH `@original` with the shared copy
   `discord_interactions::unknown_route_user_copy`
-  (`unknown_route.hpp`; `{"content": ..., "flags": 64}`) via `rest.hpp`'s
+  (`unknown_route.hpp`; `{"content": ...}`) via `rest.hpp`'s
   `discord_request` with `no_retry` (latency-sensitive path, AD-8), log the real
   SDK error to stderr, then **still return a failed invocation** for
-  observability. The friendly copy never contains the internal error text. Every
+  observability. The reply is posted with the visibility of the original
+  deferred ACK — Discord ignores `flags` on webhook message edits, so the PATCH
+  carries none and ephemerality is fixed by the ACK, not this copy. The friendly copy never contains the internal error text. Every
   other invoke failure keeps the prior behavior (log + generic failure).
 - The **sync** autocomplete router does not PATCH (it is on Discord's 3-second
   budget); it returns an empty result `{"type":8,"data":{"choices":[]}}` so

@@ -30,17 +30,24 @@ namespace discord_interactions {
 using json = nlohmann::json;
 
 // Retry envelope for discord_request (rest.hpp). max_attempts counts total
-// tries (first attempt included); max_total_wait_ms is the cumulative sleep
-// budget across all retries — a sleep that would exceed the remaining budget
-// is not taken, the request fails instead.
+// tries (first attempt included). max_total_wait_ms is a genuine TIME budget
+// (AD-8): both retry sleeps AND each attempt's transport wall-clock time are
+// charged against it — a retry (sleep or next attempt) that no longer fits in
+// the remaining budget is not taken, the request fails instead. The first
+// attempt always runs regardless of budget. max_attempt_ms is the per-attempt
+// transport ceiling (curl CURLOPT_TIMEOUT_MS), so total wall time is bounded by
+// roughly max_attempt_ms (the always-run first attempt) + max_total_wait_ms —
+// never attempts*transport + sleeps unbounded by the budget.
 struct RestRetryPolicy {
     int max_attempts = 3;
     long max_total_wait_ms = 8000;
+    long max_attempt_ms = 10000;
 };
 
 // AD-8: sync interaction paths (ingress, autocomplete) must use this — a
-// single attempt with zero sleep. They already spend their 3-second Discord
-// budget on up to two cold starts.
+// single attempt with zero sleep (max_attempt_ms keeps its 10000ms default;
+// the single attempt still gets a full transport window). They already spend
+// their 3-second Discord budget on up to two cold starts.
 inline constexpr RestRetryPolicy no_retry{1, 0};
 
 // AD-8: clamp the wait budget to the invocation deadline minus a safety
@@ -49,6 +56,12 @@ inline constexpr RestRetryPolicy no_retry{1, 0};
 // default 8000ms budget applies; with tight time the budget shrinks to
 // remaining-minus-margin; at or past the deadline the budget is zero and the
 // attempts collapse to one (nothing to wait with, so retrying is pointless).
+// The per-attempt transport ceiling (max_attempt_ms) also clamps to
+// remaining-minus-margin — floor 1000ms (the mandatory first attempt needs a
+// minimal window), cap 10000ms (the default) — so a single slow attempt cannot
+// sail past the deadline either. Combined with discord_request charging
+// transport time against the wait budget, total wall time stays around
+// max_attempt_ms + max_total_wait_ms ≤ remaining time.
 inline RestRetryPolicy retry_policy_for_deadline(
     std::chrono::time_point<std::chrono::system_clock> deadline,
     long safety_margin_ms = 2000, int max_attempts = 3) {
@@ -63,16 +76,63 @@ inline RestRetryPolicy retry_policy_for_deadline(
     if (budget_ms < 0) {
         budget_ms = 0;
     }
-    const long default_budget_ms = RestRetryPolicy{}.max_total_wait_ms;
-    if (budget_ms > default_budget_ms) {
-        budget_ms = default_budget_ms;
+    const RestRetryPolicy defaults{};
+    if (budget_ms > defaults.max_total_wait_ms) {
+        budget_ms = defaults.max_total_wait_ms;
     }
 
     policy.max_total_wait_ms = budget_ms;
     if (budget_ms == 0) {
         policy.max_attempts = 1;
     }
+
+    constexpr long attempt_floor_ms = 1000;
+    long attempt_ms = remaining_ms - safety_margin_ms;
+    if (attempt_ms < attempt_floor_ms) {
+        attempt_ms = attempt_floor_ms;
+    }
+    if (attempt_ms > defaults.max_attempt_ms) {
+        attempt_ms = defaults.max_attempt_ms;
+    }
+    policy.max_attempt_ms = attempt_ms;
     return policy;
+}
+
+// True when an HTTP status outside 2xx is worth a sleep-retry: 429 (rate
+// limit, Discord tells us how long) and 5xx (transient upstream failure).
+// Everything else — 1xx/3xx (a Discord API request should never legitimately
+// produce these; retrying cannot fix a redirect) and non-429 4xx (the request
+// itself is wrong) — is deterministic and must fail immediately. Pure.
+inline bool is_retryable_status(long status) {
+    return status == 429 || status >= 500;
+}
+
+// Redacts the live interaction token from a webhook URL so it can be stored in
+// ModuleError debug_context / logs without leaking a credential that stays
+// usable for 15 minutes. Replaces the path segment after /webhooks/<app_id>/
+// with "***", preserving any trailing path (e.g. /messages/@original). URLs
+// without that pattern are returned unchanged. Pure.
+inline std::string redact_webhook_token(const std::string& url) {
+    constexpr const char* marker = "/webhooks/";
+    const std::string::size_type marker_pos = url.find(marker);
+    if (marker_pos == std::string::npos) {
+        return url;
+    }
+    const std::string::size_type app_begin = marker_pos + std::string(marker).size();
+    const std::string::size_type app_end = url.find('/', app_begin);
+    if (app_end == std::string::npos || app_end == app_begin) {
+        return url;  // no token segment after the application id
+    }
+    const std::string::size_type token_begin = app_end + 1;
+    const std::string::size_type token_end = url.find('/', token_begin);
+    const std::string::size_type token_len =
+        (token_end == std::string::npos ? url.size() : token_end) - token_begin;
+    if (token_len == 0) {
+        return url;  // empty token segment — nothing to redact
+    }
+    std::string redacted = url;
+    redacted.replace(token_begin, token_len, "***");
+    return redacted;
 }
 
 // How long a 429 asks us to wait, in milliseconds. Preference order:

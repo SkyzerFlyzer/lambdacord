@@ -37,6 +37,8 @@ public:
 // a nonexistent worker Lambda. no_retry — routers are on the latency-sensitive
 // path (AD-8). Any failure here is logged, never rethrown: the caller still
 // fails the invocation. Never leaks the internal SDK error to the user.
+// No "flags" field: Discord ignores flags on webhook message edits, so the
+// reply simply keeps the visibility of the original deferred ACK.
 void reply_unknown_route(const json& interaction) {
     try {
         const auto meta = discord_interactions::metadata(interaction);
@@ -44,8 +46,7 @@ void reply_unknown_route(const json& interaction) {
             "PATCH",
             discord_interactions::webhook_url(meta.application_id, meta.token,
                                               "/messages/@original"),
-            json{{"content", discord_interactions::unknown_route_user_copy},
-                 {"flags", 64}},
+            json{{"content", discord_interactions::unknown_route_user_copy}},
             discord_interactions::no_retry);
     } catch (const std::exception& patch_ex) {
         std::cerr << "failed to PATCH friendly unknown-route reply: " << patch_ex.what()
@@ -69,12 +70,22 @@ void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
 
 // Look up `key` in the JSON-object route map held in env var `env_name`.
 // Returns the mapped function name, or "" when the env var is unset/empty or
-// has no string entry for the key.
+// has no string entry for the key. A malformed env value (invalid JSON or a
+// non-object) must not throw — that would turn EVERY interaction into a
+// generic failure — so it logs one stderr warning and falls back to
+// mechanical derivation.
 std::string route_map_override(const char* env_name, const std::string& key) {
     const char* route_map_env = std::getenv(env_name);
     const std::string route_map_json = route_map_env == nullptr ? "" : route_map_env;
     if (!route_map_json.empty()) {
-        const json route_map = json::parse(route_map_json);
+        const json route_map =
+            json::parse(route_map_json, nullptr, /*allow_exceptions=*/false);
+        if (!route_map.is_object()) {
+            std::cerr << env_name
+                      << " is not a JSON object; falling back to mechanical route "
+                         "derivation\n";
+            return "";
+        }
         const auto match = route_map.find(key);
         if (match != route_map.end() && match->is_string()) {
             return match->get<std::string>();

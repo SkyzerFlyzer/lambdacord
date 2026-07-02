@@ -42,6 +42,8 @@ public:
 // a nonexistent worker Lambda. no_retry — routers are on the latency-sensitive
 // path (AD-8). Any failure here is logged, never rethrown: the caller still
 // fails the invocation. Never leaks the internal SDK error to the user.
+// No "flags" field: Discord ignores flags on webhook message edits, so the
+// reply simply keeps the visibility of the original deferred ACK.
 void reply_unknown_route(const json& interaction) {
     try {
         const auto meta = discord_interactions::metadata(interaction);
@@ -49,8 +51,7 @@ void reply_unknown_route(const json& interaction) {
             "PATCH",
             discord_interactions::webhook_url(meta.application_id, meta.token,
                                               "/messages/@original"),
-            json{{"content", discord_interactions::unknown_route_user_copy},
-                 {"flags", 64}},
+            json{{"content", discord_interactions::unknown_route_user_copy}},
             discord_interactions::no_retry);
     } catch (const std::exception& patch_ex) {
         std::cerr << "failed to PATCH friendly unknown-route reply: " << patch_ex.what()

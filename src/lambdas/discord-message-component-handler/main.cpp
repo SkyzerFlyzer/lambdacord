@@ -37,6 +37,8 @@ public:
 // a nonexistent worker Lambda. no_retry — routers are on the latency-sensitive
 // path (AD-8). Any failure here is logged, never rethrown: the caller still
 // fails the invocation. Never leaks the internal SDK error to the user.
+// No "flags" field: Discord ignores flags on webhook message edits, so the
+// reply simply keeps the visibility of the original deferred ACK.
 void reply_unknown_route(const json& interaction) {
     try {
         const auto meta = discord_interactions::metadata(interaction);
@@ -44,8 +46,7 @@ void reply_unknown_route(const json& interaction) {
             "PATCH",
             discord_interactions::webhook_url(meta.application_id, meta.token,
                                               "/messages/@original"),
-            json{{"content", discord_interactions::unknown_route_user_copy},
-                 {"flags", 64}},
+            json{{"content", discord_interactions::unknown_route_user_copy}},
             discord_interactions::no_retry);
     } catch (const std::exception& patch_ex) {
         std::cerr << "failed to PATCH friendly unknown-route reply: " << patch_ex.what()
@@ -76,10 +77,19 @@ std::string component_function_name(const std::string& custom_id) {
     const char* route_map_env = std::getenv("DISCORD_COMPONENT_ROUTES");
     const std::string route_map_json = route_map_env == nullptr ? "" : route_map_env;
     if (!route_map_json.empty()) {
-        const json route_map = json::parse(route_map_json);
-        const auto match = route_map.find(prefix);
-        if (match != route_map.end() && match->is_string()) {
-            return match->get<std::string>();
+        // A malformed env value (invalid JSON or a non-object) must not throw —
+        // that would turn EVERY component interaction into a generic failure —
+        // so log one stderr warning and fall back to mechanical derivation.
+        const json route_map =
+            json::parse(route_map_json, nullptr, /*allow_exceptions=*/false);
+        if (!route_map.is_object()) {
+            std::cerr << "DISCORD_COMPONENT_ROUTES is not a JSON object; falling back "
+                         "to mechanical route derivation\n";
+        } else {
+            const auto match = route_map.find(prefix);
+            if (match != route_map.end() && match->is_string()) {
+                return match->get<std::string>();
+            }
         }
     }
 

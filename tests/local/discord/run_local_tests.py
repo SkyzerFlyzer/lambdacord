@@ -815,7 +815,10 @@ def run_application_command_tests():
             "That command isn't available right now.",
             "unknown route application friendly copy",
         )
-        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route application ephemeral flag")
+        # Discord ignores flags on webhook message edits — the PATCH inherits
+        # the visibility of the original deferred ACK, so sending flags would
+        # only mislead readers into thinking the reply is ephemeral.
+        assert_not_in("flags", patches[0]["payload"], "unknown route application PATCH carries no flags")
         patch_text = json.dumps(patches[0]["payload"])
         assert_not_in("ResourceNotFound", patch_text, "unknown route application PATCH leaks no SDK error type")
         assert_not_in("Function not found", patch_text, "unknown route application PATCH leaks no SDK error message")
@@ -824,6 +827,27 @@ def run_application_command_tests():
         status, text = container.invoke({"type": 2, "data": {}})
         assert_equal(status, 200, "application handler missing name HTTP status")
         assert_in("internal error", text, "application handler missing name error")
+
+    # Malformed route-map env JSON must not turn every interaction into a
+    # failure: the router logs one warning and falls back to mechanical
+    # derivation instead of throwing out of json::parse.
+    reset_mock()
+    broken_env = dict(env)
+    broken_env["DISCORD_COMMAND_ROUTES"] = "not json"
+    with LambdaContainer("discord-application-command-handler.zip", broken_env) as container:
+        status, text = container.invoke({"type": 2, "data": {"name": "ping"}})
+        assert_equal(status, 200, "malformed route map HTTP status")
+        assert_equal(
+            parse_json(text, "malformed route map success")["ok"],
+            True,
+            "malformed route map success payload",
+        )
+        logs = get_logs()
+        assert_equal(
+            logs[0]["function_name"],
+            "discord-cmd-ping",
+            "malformed route map falls back to mechanical route",
+        )
 
 
 def run_message_component_tests():
@@ -867,7 +891,8 @@ def run_message_component_tests():
             "That command isn't available right now.",
             "unknown route component friendly copy",
         )
-        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route component ephemeral flag")
+        # Discord ignores flags on webhook message edits (see application suite).
+        assert_not_in("flags", patches[0]["payload"], "unknown route component PATCH carries no flags")
         patch_text = json.dumps(patches[0]["payload"])
         assert_not_in("ResourceNotFound", patch_text, "unknown route component PATCH leaks no SDK error type")
         assert_not_in("Function not found", patch_text, "unknown route component PATCH leaks no SDK error message")
@@ -918,7 +943,8 @@ def run_modal_tests():
             "That command isn't available right now.",
             "unknown route modal friendly copy",
         )
-        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route modal ephemeral flag")
+        # Discord ignores flags on webhook message edits (see application suite).
+        assert_not_in("flags", patches[0]["payload"], "unknown route modal PATCH carries no flags")
         patch_text = json.dumps(patches[0]["payload"])
         assert_not_in("ResourceNotFound", patch_text, "unknown route modal PATCH leaks no SDK error type")
         assert_not_in("Function not found", patch_text, "unknown route modal PATCH leaks no SDK error message")
