@@ -6,6 +6,12 @@ This repo builds AWS Lambda functions in C++ targeting `provided.al2023` (arm64 
 
 Module-specific instructions live in each module's own `AGENTS.md` and `CLAUDE.md`. Read those before changing module code.
 
+The per-header API reference for the framework (`src/include/discord_interactions/`)
+lives in [`docs/framework-reference.md`](docs/framework-reference.md): one section per
+public header with condensed signatures and a usage example, plus the architecture
+contract (headers compiled into each Lambda, custom_id as the only free state channel,
+the AD-8 deadline rule, and the AD-9 completion-marker default).
+
 ---
 
 ## Build System
@@ -218,6 +224,22 @@ routers reply cleanly:
 | `DISCORD_IDEMPOTENCY_TABLE` | No | DynamoDB table name for durable cross-container interaction dedup (Phase 5 / AD-9). Unset or empty ⇒ both `idempotency_store.hpp` primitives no-op to "proceed". Opt-in per worker Lambda; provision the table via the root `discord_idempotency_table_enabled` Terraform variable. |
 | `AWS_DYNAMODB_ENDPOINT` | No | Override DynamoDB endpoint for the `idempotency_store.hpp` warm-global client (local testing — mirrors `AWS_LAMBDA_ENDPOINT`; the `dedup` suite points it at the mock server) |
 
+### Router route-map overrides
+
+Each router derives its worker Lambda name mechanically (see the routing diagram
+below). Optionally, an env var holding a JSON object can override that derivation
+per key; when unset, empty, or missing the key, the router falls back to the
+mechanical name. These are how the framework wires generated per-module route maps
+into the routers. The **modal** and **autocomplete** routers have no such override —
+they always derive mechanically.
+
+| Variable | Router | Key | Description |
+|---|---|---|---|
+| `DISCORD_COMMAND_ROUTES` | application-command | full command path (`account link`) | JSON object mapping a slash-command path to its worker Lambda; falls back to `discord-cmd-<path>`. |
+| `DISCORD_USER_COMMAND_ROUTES` | application-command | raw command name (`Report User`) | JSON object mapping a user context-menu command name to its worker Lambda; falls back to `discord-usercmd-<name>`. |
+| `DISCORD_MESSAGE_COMMAND_ROUTES` | application-command | raw command name | JSON object mapping a message context-menu command name to its worker Lambda; falls back to `discord-msgcmd-<name>`. |
+| `DISCORD_COMPONENT_ROUTES` | message-component | component `custom_id` prefix (text before the first `:`) | JSON object mapping a component prefix to its worker Lambda; falls back to `discord-component-<prefix>`. |
+
 ### Discord REST helpers
 
 | Variable | Required | Description |
@@ -243,7 +265,7 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 1. Verifies Docker is available and the RIE image can run on `linux/arm64`.
 2. Starts `tests/local/discord/mock_lambda_server.py` on port `19001`.
 3. Extracts each zip from `packaged-lambdas/` into a temp directory and mounts it as `/var/runtime` inside an RIE container.
-4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing, REST layer (`rest`), durable interaction dedup (`dedup`).
+4. Runs test suites: `ingress`, `application` (application-command routing), `component` (component routing), `modal` (modal routing), `autocomplete` (autocomplete routing), `rest` (REST layer), `dedup` (durable interaction dedup), and `nitrado-responses`. Select a subset with one or more `--suite <name>` flags. The `nitrado-responses` suite is module-specific and self-skips (prints `SKIP`) when `modules/nitrado` is not installed; it is the only suite that runs without the Docker/RIE control-plane mock.
 5. Tears everything down and prints `All local Discord Lambda tests passed.` on success.
 
 **All zips must be built before running tests.** Build them all first:

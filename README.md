@@ -1,9 +1,34 @@
 # Discord Interactions C++ Lambda Framework
 
 This repository contains the main C++ Discord interactions framework for AWS
-Lambda on `provided.al2023`. The framework lives in `src/` and handles generic
-Discord request verification, routing, response helpers, pagination, followups,
-and structured module error flow.
+Lambda on `provided.al2023`. The framework lives in `src/` as a set of
+header-only helpers (`src/include/discord_interactions/`) compiled into each
+gateway/router/worker Lambda, plus the gateway Lambdas that verify inbound
+Discord requests and route them by interaction type.
+
+What the framework covers:
+
+- **Ingress & routing** — Ed25519 signature verification, dispatch by interaction
+  type, and mechanical routing of slash commands, user/message context menus,
+  components, modals, and autocomplete to per-module worker Lambdas.
+- **Rate-limit-aware REST** — a curl-based Discord REST core with 429/5xx retry
+  whose wait budget is clamped to the Lambda invocation deadline (sync interaction
+  paths never sleep-retry), plus the interaction-webhook message lifecycle
+  (followup / edit / delete).
+- **Response builders** — embeds, message components (buttons, selects, action
+  rows), Components V2 layouts, modals, autocomplete choices, pagination, premium
+  buttons, and Discord formatting utilities, all clamped to Discord's documented
+  limits.
+- **State & correctness** — a structured `custom_id` state codec (the only
+  serverless state channel), typed command-option access, structured module
+  errors, ephemeral deferred ACKs declared per command, and opt-in DynamoDB-backed
+  interaction dedup (completion-marker default, at-most-once claim opt-in).
+- **Developer tooling** — a scaffolding generator for new module Lambdas, a fast
+  C++ (doctest) and Python (pytest) unit-test layer, and a GitHub Actions CI
+  workflow that runs both plus static checks on every push and pull request.
+
+The per-header API reference — signatures, usage examples, and the architecture
+contract — is in [`docs/framework-reference.md`](docs/framework-reference.md).
 
 Feature modules are locally installed repos under `modules/<name>/`. A module owns its
 own command schema, Lambda folders, error mappings, Terraform, and module docs.
