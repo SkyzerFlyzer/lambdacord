@@ -11,7 +11,14 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# One in-flight run per ref: a new push to a branch (or PR) cancels the
+# previous run instead of double-spending runners on the heavy Docker jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # C++ unit tests (doctest). Compiles tests/unit/cpp against src/include inside
@@ -98,13 +105,30 @@ jobs:
       - name: Compute diff range
         id: range
         run: |
+          set -euo pipefail
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             range="origin/${{ github.base_ref }}...HEAD"
-          elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
-            # First push of a new branch: no meaningful "before" SHA.
-            range="HEAD~1...HEAD"
           else
-            range="${{ github.event.before }}...HEAD"
+            before="${{ github.event.before }}"
+            # github.event.before is unusable when it is the all-zeros SHA (first
+            # push of a new branch) or points at a commit that no longer exists
+            # after a force push (rewritten/orphaned history). git rev-parse
+            # verifies it actually resolves before we hand it to `git diff`; an
+            # unreachable base would otherwise make the static-checks job fatal.
+            if [[ "${before}" =~ ^0+$ ]] || ! git rev-parse -q --verify "${before}^{commit}" >/dev/null 2>&1; then
+              if git rev-parse -q --verify "origin/main^{commit}" >/dev/null 2>&1; then
+                range="origin/main...HEAD"
+              elif git rev-parse -q --verify "HEAD~1^{commit}" >/dev/null 2>&1; then
+                range="HEAD~1...HEAD"
+              else
+                # Root commit with no origin/main: diff against the empty tree so
+                # every file in the initial commit is still analyzed.
+                empty_tree="$(git hash-object -t tree /dev/null)"
+                range="${empty_tree}..HEAD"
+              fi
+            else
+              range="${before}...HEAD"
+            fi
           fi
           echo "range=${range}" >> "${GITHUB_OUTPUT}"
 

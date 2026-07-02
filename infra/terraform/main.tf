@@ -103,10 +103,32 @@ locals {
     "discord-error-mapper-*",
   ]
 
-  router_invoke_arns = [
-    for function_name in local.router_invoke_targets :
-    "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
-  ]
+  # Route maps may point a route at a non-mechanical Lambda name via the
+  # DISCORD_*_ROUTES override feature (a manifest route target need not be the
+  # derived discord-cmd-<path> / discord-component-<prefix> / ... name). The
+  # wildcard prefixes above only cover the mechanical names, so a router would
+  # get AccessDenied invoking an overridden target. Collect every distinct route
+  # target across ALL route kinds of every installed manifest — reusing the same
+  # try(target.lambda, target) normalization as the route-map locals — and grant
+  # invoke on each by exact name. Overlap with the wildcard prefixes is harmless.
+  module_route_target_names = distinct(flatten([
+    for manifest in local.module_manifests : [
+      for _kind, routes in manifest.routes : [
+        for _route, target in routes : try(target.lambda, target)
+      ]
+    ]
+  ]))
+
+  router_invoke_arns = concat(
+    [
+      for function_name in local.router_invoke_targets :
+      "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
+    ],
+    [
+      for function_name in local.module_route_target_names :
+      "arn:${data.aws_partition.current.partition}:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${function_name}"
+    ]
+  )
 }
 
 data "aws_iam_policy_document" "lambda_assume_role" {

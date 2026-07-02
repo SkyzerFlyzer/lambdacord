@@ -307,6 +307,14 @@ distinct interaction ids stay independent, and that unsetting
 with a test-only `test_fail_before_patch` field in the interaction payload
 (payload, not env, so one warm container serves both the crash and the retry).
 
+`tests/local/discord/fixtures/build-smoke-dynamodb/` is a manual/one-shot
+compile-and-link proof that a worker can link the DynamoDB SDK client — it is
+**not** wired into any suite or into CI. The `dedup` suite's
+`discord-cmd-test-dedup` fixture supersedes it: that fixture builds a
+DynamoDB-linked worker (and exercises it end-to-end) on every run, so
+`build-smoke-dynamodb` is only useful for a standalone linkage check and can be
+ignored in the normal test flow.
+
 ### Mock server API
 
 The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:

@@ -12,12 +12,14 @@ include(FetchContent)
 FetchContent_Declare(
   doctest
   URL https://github.com/doctest/doctest/archive/refs/tags/v2.4.12.tar.gz
+  URL_HASH SHA256=73381c7aa4dee704bd935609668cf41880ea7f19fa0504a200e13b74999c2d70
 )
 FetchContent_MakeAvailable(doctest)
 
 FetchContent_Declare(
   json
   URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+  URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
 )
 FetchContent_MakeAvailable(json)
 

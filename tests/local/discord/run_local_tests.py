@@ -123,8 +123,19 @@ def ensure_fixture_zip(fixture_dir):
 
     zip_name = f"{fixture_dir.name}.zip"
     zip_path = PACKAGED_DIR / zip_name
+    # Fixtures compile against the framework headers under src/include, so a
+    # header edit invalidates a previously built fixture binary just as much as
+    # editing the fixture sources does. Fold the newest src/include mtime into
+    # the staleness comparison, otherwise a header change leaves a stale binary
+    # and a false-green suite locally.
+    include_dir = REPO_ROOT / "src" / "include"
     source_mtime = max(
-        (path.stat().st_mtime for path in fixture_dir.rglob("*") if path.is_file()),
+        (
+            path.stat().st_mtime
+            for tree in (fixture_dir, include_dir)
+            for path in tree.rglob("*")
+            if path.is_file()
+        ),
         default=0.0,
     )
     if zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
@@ -171,6 +182,49 @@ def wait_for_lambda(port):
     raise TestFailure(f"lambda runtime did not become ready on port {port}: {last_error}")
 
 
+def wait_for_mock_server(process, timeout=5.0):
+    """Block until the mock control-plane answers, or fail with diagnostics.
+
+    The mock is a plain subprocess with no readiness handshake. A blind sleep
+    hides the common failure where MOCK_PORT is already in use: the process dies
+    immediately and every suite then fails with confusing connection-refused
+    errors far from the real cause. Poll /__logs instead, and on failure surface
+    a clear message plus whatever the process wrote to stderr before dying.
+    """
+    url = f"http://127.0.0.1:{MOCK_PORT}/__logs"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        try:
+            http_json("GET", url)
+            return
+        except Exception:
+            time.sleep(0.1)
+
+    # Never became ready: stop it if it is somehow still alive, then drain the
+    # captured stderr for the failure message.
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    captured = b""
+    if process.stderr is not None:
+        try:
+            captured = process.stderr.read() or b""
+        except Exception:
+            captured = b""
+
+    details = f"mock server failed to start — is port {MOCK_PORT} in use?"
+    text = captured.decode("utf-8", errors="replace").strip()
+    if text:
+        details += f"\nmock server stderr:\n{text}"
+    raise TestFailure(details)
+
+
 class LambdaContainer:
     def __init__(self, zip_name, env):
         self.zip_name = zip_name
@@ -209,8 +263,10 @@ class LambdaContainer:
             # mock server on the host.
             "--add-host",
             "host.docker.internal:host-gateway",
+            # Bind only loopback: the harness reaches the RIE over 127.0.0.1, so
+            # there is no reason to publish the container port on every interface.
             "-p",
-            f"{self.port}:8080",
+            f"127.0.0.1:{self.port}:8080",
             "-v",
             f"{self.tempdir}:/var/runtime:ro",
         ]
@@ -1618,16 +1674,19 @@ def main():
     mock_server = None
     if any(suite in docker_suites for suite in suites):
         docker_preflight()
+        # Capture stderr to a pipe (not DEVNULL) so a failed start — most often
+        # "port already in use" — can be reported. log_message is silenced in
+        # the mock, so stderr only carries real errors and never fills the pipe
+        # during a normal run.
         mock_server = subprocess.Popen(
             [sys.executable, str(MOCK_SERVER), str(MOCK_PORT)],
             cwd=REPO_ROOT,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        wait_for_mock_server(mock_server)
 
     try:
-        if mock_server is not None:
-            time.sleep(0.5)
         for suite in suites:
             if suite == "ingress":
                 run_ingress_tests()
