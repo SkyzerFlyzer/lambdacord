@@ -57,6 +57,8 @@ User-facing entrypoints are documented in `README.md`. Agent/helper scripts are:
 | Script | Intended use |
 |---|---|
 | `scripts/build-lambda-in-docker.sh` | Internal build implementation called by `scripts/build-lambda.sh` inside the builder container. Do not ask users to call it directly. |
+| `scripts/test-unit.sh` | Compiles and runs the C++ doctest unit suite (`tests/unit/cpp/`) against `src/include` inside the builder image on the host arch. No zip packaging, no RIE. Honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, `LAMBDA_SKIP_IMAGE_BUILD`. Optional `--filter <doctest-filter>`. |
+| `scripts/test-unit-in-docker.sh` | Internal build+run implementation for the C++ unit suite, called by `scripts/test-unit.sh` inside the builder container. Do not ask users to call it directly. |
 | `scripts/lib/discord_modules.py` | Shared Python helper for module manifest discovery, route merging, schema merging, and validation. Import from user-facing scripts instead of duplicating manifest parsing. |
 | `scripts/generate-terraform-modules.py` | Generates root Terraform module calls, pass-through variables, manifest locals, and module output proxies from installed module manifests. Run after adding/removing module Terraform. |
 | `scripts/pre-commit-static-checks.sh` | Hook/agent static-analysis runner. Users may run it manually, but the README points them at `scripts/install-git-hooks.sh` first. |
@@ -165,6 +167,8 @@ should see it, PATCH `@original`.
 ---
 
 ## Local Testing
+
+Fast C++ unit tests: `scripts/test-unit.sh` compiles `tests/unit/cpp/*.cpp` against `src/include` inside the builder image (host arch, no zip, no RIE) and runs the doctest suite; exit code propagates. Add a test file by dropping `tests/unit/cpp/test_<name>.cpp` — the CMake `file(GLOB ...)` picks it up with no CMakeLists edit. Filter with `scripts/test-unit.sh --filter '<doctest-filter>'`. It honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, and `LAMBDA_SKIP_IMAGE_BUILD` exactly like `scripts/build-lambda.sh`.
 
 Fast Python unit tests (no Docker): `python3 -m pytest tests/unit/python` runs the Python unit layer for `scripts/lib`.
 

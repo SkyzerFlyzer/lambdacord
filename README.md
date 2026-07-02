@@ -40,6 +40,7 @@ These are the scripts normal project users should reach for:
 |---|---|
 | `scripts/build-lambda.sh <lambda-folder>` | Build one C++ Lambda zip from a framework or module Lambda folder. |
 | `scripts/build-all-lambdas.sh` | Build every Lambda declared by the framework and installed module manifests. Run this before Terraform deploys. |
+| `scripts/test-unit.sh` | Run the fast C++ unit test suite (doctest) in seconds. Compiles `tests/unit/cpp/` against `src/include` inside the builder image; no zip build or emulator needed. Optional `--filter <doctest-filter>`. |
 | `scripts/test-local-discord-lambdas.sh` | Run the local Discord Lambda integration suites against built zip artifacts. |
 | `scripts/generate-terraform-modules.py` | Regenerate root Terraform module wiring from installed module manifests. |
 | `scripts/terraform-deploy.sh <action>` | Regenerate module Terraform wiring, optionally build Lambdas, then run Terraform `init`, `validate`, `plan`, `apply`, or `output`. |
@@ -273,6 +274,17 @@ with values to copy into the root stack's `terraform.tfvars` or pass as an
 additional Terraform var-file.
 
 ## Local Testing
+
+The fast C++ unit tests need no zip build or emulator — just Docker (the suite
+compiles and runs inside the builder image, on your host architecture):
+
+```bash
+scripts/test-unit.sh                       # run all C++ unit tests
+scripts/test-unit.sh --filter 'route*'     # run a subset by doctest filter
+```
+
+Add a test by dropping `tests/unit/cpp/test_<name>.cpp`; it is picked up
+automatically. The integration suites below additionally require built zips.
 
 Build all zips before running local tests:
 
