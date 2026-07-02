@@ -105,7 +105,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19001
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # Bind all interfaces: RIE containers reach this server via the Docker
+    # host-gateway address, which a 127.0.0.1 bind is invisible to on native
+    # Linux (Docker Desktop's NAT masked this).
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
 
 
