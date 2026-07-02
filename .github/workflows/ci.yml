@@ -2,11 +2,12 @@ name: CI
 
 # Fast test layers + static checks on every push and pull request.
 #
-# Note: the Docker integration harness (scripts/test-local-discord-lambdas.sh)
-# is intentionally NOT run here. It boots the AWS Lambda Runtime Interface
-# Emulator on linux/arm64, which requires QEMU-based arm64 emulation on the
-# x86_64 GitHub-hosted runners. That is slow and flaky in CI; the integration
-# harness stays a local/manual step. See CLAUDE.md "Local Testing".
+# Note: scripts/test-local-discord-lambdas.sh is not invoked directly here
+# because its default linux/arm64 RIE run needs slow, flaky QEMU emulation on
+# the x86_64 GitHub-hosted runners. The static-checks job does exercise the same
+# integration harness (run_local_tests.py under valgrind), but only when a change
+# touches a Discord Lambda, and it forces the native linux/amd64 platform so no
+# arm64 emulation is involved. See CLAUDE.md "Local Testing".
 
 on:
   push:
@@ -60,13 +61,56 @@ jobs:
       - name: Run Python unit tests
         run: python3 -m pytest tests/unit/python -q
 
-  # Static analysis / pre-commit checks. Docker is preinstalled on
-  # ubuntu-latest runners, which is all this script needs.
+  # Static analysis / pre-commit checks, run against the PR/push diff range.
+  #
+  # The pre-commit hook selects targets from the staged index, which is empty on
+  # a fresh CI checkout. We pass --diff-range so the script analyzes the files
+  # the change actually touched. For any affected Discord Lambda this script
+  # builds the gateway zips in Docker and runs the RIE integration harness under
+  # valgrind, so this job needs the builder image (like cpp-unit) and runs on
+  # x86_64 natively (linux/amd64) to avoid QEMU arm64 emulation.
   static-checks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history so the diff range can reach the merge base / previous
+          # commit; the default shallow checkout only has HEAD.
+          fetch-depth: 0
+
+      # Same cached builder image as cpp-unit; --load + LAMBDA_SKIP_IMAGE_BUILD=1
+      # lets the script reuse it instead of rebuilding.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build builder image (x86_64, cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lambda-builder/Dockerfile
+          platforms: linux/amd64
+          tags: lambdacord-lambda-builder:x86_64
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Compute diff range
+        id: range
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            range="origin/${{ github.base_ref }}...HEAD"
+          elif [[ "${{ github.event.before }}" =~ ^0+$ ]]; then
+            # First push of a new branch: no meaningful "before" SHA.
+            range="HEAD~1...HEAD"
+          else
+            range="${{ github.event.before }}...HEAD"
+          fi
+          echo "range=${range}" >> "${GITHUB_OUTPUT}"
 
       - name: Run static checks
-        run: scripts/pre-commit-static-checks.sh
+        run: |
+          LAMBDA_ARCH=x86_64 \
+          LAMBDA_SKIP_IMAGE_BUILD=1 \
+          DISCORD_TEST_PLATFORM=linux/amd64 \
+          scripts/pre-commit-static-checks.sh --diff-range "${{ steps.range.outputs.range }}"
