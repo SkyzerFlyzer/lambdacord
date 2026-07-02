@@ -217,10 +217,14 @@ inline RestResponse discord_request(const std::string& method, const std::string
     long remaining_budget_ms = policy.max_total_wait_ms > 0 ? policy.max_total_wait_ms : 0;
 
     long last_status = 0;
+    // First attempt gets the policy's full transport ceiling; retries shrink
+    // to the remaining budget (see the retry gate below) so sleeps and retry
+    // transports together can never exceed max_total_wait_ms (AD-8).
+    long attempt_ceiling_ms = policy.max_attempt_ms;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         const auto attempt_start = std::chrono::steady_clock::now();
         const rest_detail::AttemptResult result = rest_detail::perform_once(
-            method, url, request_body, has_body, policy.max_attempt_ms);
+            method, url, request_body, has_body, attempt_ceiling_ms);
         // AD-8: transport wall time and retry sleeps draw from one pool —
         // charge this attempt's elapsed time against the remaining budget.
         const long attempt_elapsed_ms = static_cast<long>(
@@ -256,15 +260,21 @@ inline RestResponse discord_request(const std::string& method, const std::string
                                      ? parse_retry_after(result.status, result.headers,
                                                          result.body)
                                      : backoff_ms(attempt);
-            if (wait_ms <= remaining_budget_ms) {
+            // AD-8: a retry is taken only when the sleep AND a minimally
+            // useful next attempt (min_retry_attempt_ms) both fit the
+            // remaining budget, and the retry's transport ceiling shrinks to
+            // the budget left after the sleep — a sleep can never consume the
+            // pool and still admit a full-ceiling attempt past the deadline.
+            if (wait_ms + min_retry_attempt_ms <= remaining_budget_ms) {
                 std::cerr << "discord_request: HTTP " << result.status << " on " << method
                           << ", retrying in " << wait_ms << "ms (attempt " << (attempt + 1)
                           << "/" << max_attempts << ")" << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
                 remaining_budget_ms -= wait_ms;
+                attempt_ceiling_ms = std::min(policy.max_attempt_ms, remaining_budget_ms);
                 continue;
             }
-            // AD-8: the retry (sleep + another attempt) no longer fits in the
+            // The retry (sleep + another attempt) no longer fits in the
             // remaining time budget — fail instead of overrunning the deadline.
         }
         break;

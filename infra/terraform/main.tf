@@ -20,7 +20,7 @@ locals {
   # that is not a plain string and fall back to the mechanical Lambda name.
   discord_command_routes = {
     for route, target in merge([
-      for manifest in local.module_manifests : manifest.routes.commands
+      for manifest in local.module_manifests : try(manifest.routes.commands, {})
     ]...) : route => try(target.lambda, target)
   }
 
@@ -43,7 +43,7 @@ locals {
 
   discord_component_routes = {
     for route, target in merge([
-      for manifest in local.module_manifests : manifest.routes.components
+      for manifest in local.module_manifests : try(manifest.routes.components, {})
     ]...) : route => try(target.lambda, target)
   }
 

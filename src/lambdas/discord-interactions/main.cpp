@@ -5,6 +5,7 @@
 #include <aws/lambda/model/InvokeRequest.h>
 #include <aws/lambda-runtime/runtime.h>
 #include <discord_interactions/interaction.hpp>
+#include <discord_interactions/json_access.hpp>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
@@ -147,7 +148,10 @@ bool ephemeral_defer_requested(const json& interaction) {
     if (kind == discord_interactions::ApplicationCommandKind::chat_input) {
         command_path = discord_interactions::application_command_path(interaction);
     } else {
-        command_path = data->value("name", "");
+        // Throw-free read (json_access.hpp): a wrong-typed "name" must fall
+        // back to no-opt-in, not throw into the generic 500 path.
+        command_path =
+            discord_interactions::get_if<std::string>(*data, "name").value_or("");
     }
 
     // csv is guarded non-null and non-empty above; bug hunting cannot see

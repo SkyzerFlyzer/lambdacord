@@ -149,9 +149,12 @@ bool patch_friendly_error(const std::string& application_id, const std::string& 
     try {
         discord_interactions::patch_original_response(
             application_id, token,
-            // Ephemeral (flags: 64) via ephemeral_message.
-            discord_interactions::ephemeral_message(
-                "Something went wrong handling that. Please try again."));
+            // NOTE: visibility of this @original edit follows the deferred
+            // ACK the gateway already sent — Discord ignores flags on webhook
+            // edits. To make this command's replies ephemeral, set
+            // "ephemeral_defer": true on its manifest route (AGENTS.md).
+            json{{"content",
+                  "Something went wrong handling that. Please try again."}});
         return true;
     } catch (const std::exception& patch_error) {
         std::fprintf(stderr, "__FN__ failed to PATCH error response: %s\n", patch_error.what());
@@ -177,8 +180,10 @@ aws::lambda_runtime::invocation_response handler(
         //   throw MODULE_ERROR("bad_input",
         //                      discord_interactions::ErrorCategory::validation,
         //                      "internal reason for logs only");
-        json message = discord_interactions::ephemeral_message(
-            "TODO: reply from __FN__.");  // ephemeral (flags: 64)
+        // Visibility follows the deferred ACK (Discord ignores flags on
+        // webhook edits); opt the route into "ephemeral_defer": true in the
+        // module manifest if this command's replies must be ephemeral.
+        json message = json{{"content", "TODO: reply from __FN__."}};
 
         // Success path: PATCH @original, then acknowledge the runtime.
         discord_interactions::patch_original_response(application_id, token, message);

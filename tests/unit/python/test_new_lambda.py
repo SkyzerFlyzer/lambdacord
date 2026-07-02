@@ -296,8 +296,12 @@ class TestCommandTemplate:
         text = self._generate(repo_root, make_module)
         assert "application_id{}" in text
 
-    def test_ephemeral_flag_response(self, repo_root, make_module):
-        assert "ephemeral_message" in self._generate(repo_root, make_module)
+    def test_no_misleading_ephemeral_labeling(self, repo_root, make_module):
+        # Discord ignores flags on webhook edits: the template must not label
+        # @original PATCHes ephemeral; it points authors at ephemeral_defer.
+        text = self._generate(repo_root, make_module)
+        assert "ephemeral_message" not in text
+        assert "ephemeral_defer" in text
 
     def test_never_leaks_what_into_user_payload(self, repo_root, make_module):
         text = self._generate(repo_root, make_module)

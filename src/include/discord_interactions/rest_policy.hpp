@@ -50,6 +50,13 @@ struct RestRetryPolicy {
 // their 3-second Discord budget on up to two cold starts.
 inline constexpr RestRetryPolicy no_retry{1, 0};
 
+// Minimum transport window a retry attempt must have left after its sleep.
+// discord_request only takes a retry when sleep + this floor still fit the
+// remaining budget, and it shrinks the retry's transport ceiling to whatever
+// budget remains — so a sleep can never consume the whole pool and still admit
+// a full-ceiling attempt that overruns the deadline (AD-8).
+inline constexpr long min_retry_attempt_ms = 250;
+
 // AD-8: clamp the wait budget to the invocation deadline minus a safety
 // margin, so a retry never outlives the function timeout. The deadline comes
 // from aws::lambda_runtime::invocation_request::deadline. With ample time the
