@@ -145,4 +145,34 @@ inline std::string join_url(const std::string& base, const std::string& path) {
     return joined;
 }
 
+// --- Interaction-webhook path helpers (T2.2) --------------------------------
+//
+// Pure, network-free builders for the webhook-token message routes. They live
+// here (not webhook_messages.hpp) so the unit suite, which compiles without
+// curl/AWS include paths, can assert URL construction directly. The executing
+// lifecycle functions in webhook_messages.hpp compose these with a base URL —
+// join_url(discord_api_base_url(), <path>) — collapsing every seam to exactly
+// one '/', matching webhook_url()'s conventions in rest.hpp.
+
+// "/webhooks/APP/TOKEN" — the interaction-webhook base path.
+inline std::string webhook_base_path(const std::string& application_id,
+                                     const std::string& token) {
+    return "/webhooks/" + application_id + "/" + token;
+}
+
+// "/webhooks/APP/TOKEN/messages/@original" — the original interaction response.
+inline std::string original_message_path(const std::string& application_id,
+                                         const std::string& token) {
+    return webhook_base_path(application_id, token) + "/messages/@original";
+}
+
+// "/webhooks/APP/TOKEN/messages/MSG" — a specific followup/message id. An empty
+// message_id yields the collection path with a trailing '/'; callers must
+// supply a real id.
+inline std::string followup_message_path(const std::string& application_id,
+                                         const std::string& token,
+                                         const std::string& message_id) {
+    return webhook_base_path(application_id, token) + "/messages/" + message_id;
+}
+
 }  // namespace discord_interactions
