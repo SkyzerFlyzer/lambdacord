@@ -15,17 +15,37 @@ locals {
 
   # Route values may be the plain string form ("discord-cmd-x") or the object
   # form ({"lambda" = "discord-cmd-x", "ephemeral_defer" = true}, T3.2).
-  # Normalize to the target Lambda name so DISCORD_COMMAND_ROUTES stays a
-  # string-to-string map for the application-command handler.
+  # Normalize to the target Lambda name so the route-map env vars stay
+  # string-to-string maps for the routers — the C++ handlers ignore any value
+  # that is not a plain string and fall back to the mechanical Lambda name.
   discord_command_routes = {
     for route, target in merge([
       for manifest in local.module_manifests : manifest.routes.commands
     ]...) : route => try(target.lambda, target)
   }
 
-  discord_component_routes = merge([
-    for manifest in local.module_manifests : manifest.routes.components
-  ]...)
+  # User / message context-menu route maps (T3.1). Keyed by the raw command
+  # name and consumed by the application-command handler via
+  # DISCORD_USER_COMMAND_ROUTES / DISCORD_MESSAGE_COMMAND_ROUTES, mirroring
+  # discord_command_routes. These route kinds are optional, so guard the
+  # per-manifest lookup with try(..., {}) for manifests that omit them.
+  discord_user_command_routes = {
+    for route, target in merge([
+      for manifest in local.module_manifests : try(manifest.routes.user_commands, {})
+    ]...) : route => try(target.lambda, target)
+  }
+
+  discord_message_command_routes = {
+    for route, target in merge([
+      for manifest in local.module_manifests : try(manifest.routes.message_commands, {})
+    ]...) : route => try(target.lambda, target)
+  }
+
+  discord_component_routes = {
+    for route, target in merge([
+      for manifest in local.module_manifests : manifest.routes.components
+    ]...) : route => try(target.lambda, target)
+  }
 
   router_functions = {
     "discord-interactions" = {
@@ -48,7 +68,9 @@ locals {
     "discord-application-command-handler" = {
       zip_path = "${local.zip_root}/discord-application-command-handler.zip"
       environment = {
-        DISCORD_COMMAND_ROUTES = jsonencode(local.discord_command_routes)
+        DISCORD_COMMAND_ROUTES         = jsonencode(local.discord_command_routes)
+        DISCORD_USER_COMMAND_ROUTES    = jsonencode(local.discord_user_command_routes)
+        DISCORD_MESSAGE_COMMAND_ROUTES = jsonencode(local.discord_message_command_routes)
       }
     }
     "discord-message-component-handler" = {
@@ -73,6 +95,8 @@ locals {
     "discord-modal-handler",
     "discord-autocomplete-handler",
     "discord-cmd-*",
+    "discord-usercmd-*",
+    "discord-msgcmd-*",
     "discord-component-*",
     "discord-modal-*",
     "discord-autocomplete-*",
