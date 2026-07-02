@@ -244,3 +244,27 @@ focused on the framework contract.
   return values are not user-visible in the async routing path.
 - Never pass raw internal exception text, upstream API bodies, AWS SDK errors, provider errors, or `ex.what()` directly to Discord users or browser-facing pages. Log internal details to stderr/CloudWatch, then map expected validation cases through module-owned structured error mappings or another explicit allowlist. For infrastructure, Discord API, external API, storage, JSON parsing, or curl failures, send a short friendly retry/action message instead.
 - Validate user-controlled Discord command options before calling storage/API helpers. In particular, parse numeric IDs at the command boundary and return friendly validation copy instead of relying on helper exceptions such as `std::stoll`.
+
+### Interaction idempotency
+
+AWS async invocation is at-least-once and retries failed runs, so a worker
+Lambda can receive the same interaction twice. `CompletedInteractions`
+(`src/include/discord_interactions/idempotency.hpp`) is an in-process guard
+against re-doing work that already completed on the same warm container. Per
+AD-9 it is a **completion marker, not a claim**: `was_completed` is a const,
+side-effect-free check, and `mark_completed` records an id with true LRU
+eviction (re-marking an id refreshes its recency).
+
+- Usage contract — **check → act → PATCH → mark**:
+  1. `if (completed.was_completed(id)) return;` — skip already-finished work.
+  2. Do the work and PATCH `@original` — the user-visible effect.
+  3. `completed.mark_completed(id);` — **only after** the PATCH succeeded.
+- Never `mark_completed` before the user-visible effect has happened. Marking
+  first means a crash before the PATCH leaves the user stuck on "thinking…"
+  because the retry would see the marker and skip it. Marking only after
+  success makes duplicates of a success skip while retries of a crash correctly
+  re-run.
+- Scope honestly: this catches duplicates on the **same warm container** only;
+  retries minutes later often land on a cold container with an empty guard.
+  Durable cross-container dedup is the Phase 5 DynamoDB primitives. Do not wire
+  this into router Lambdas — workers own the decision.
