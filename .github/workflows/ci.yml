@@ -1,0 +1,72 @@
+name: CI
+
+# Fast test layers + static checks on every push and pull request.
+#
+# Note: the Docker integration harness (scripts/test-local-discord-lambdas.sh)
+# is intentionally NOT run here. It boots the AWS Lambda Runtime Interface
+# Emulator on linux/arm64, which requires QEMU-based arm64 emulation on the
+# x86_64 GitHub-hosted runners. That is slow and flaky in CI; the integration
+# harness stays a local/manual step. See CLAUDE.md "Local Testing".
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # C++ unit tests (doctest). Compiles tests/unit/cpp against src/include inside
+  # the Amazon Linux 2023 builder image, on the runner's native x86_64 arch.
+  cpp-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the builder image once, for x86_64, with a GitHub Actions layer
+      # cache so the aws-lambda-cpp / aws-sdk-cpp compile is reused across runs.
+      # --load makes the image available to the local Docker daemon so the test
+      # script can reuse it via LAMBDA_SKIP_IMAGE_BUILD=1.
+      - name: Build builder image (x86_64, cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lambda-builder/Dockerfile
+          platforms: linux/amd64
+          tags: lambdacord-lambda-builder:x86_64
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run C++ unit tests
+        run: LAMBDA_ARCH=x86_64 LAMBDA_SKIP_IMAGE_BUILD=1 scripts/test-unit.sh
+
+  # Python unit tests (pytest) for scripts/lib helpers.
+  python-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run Python unit tests
+        run: python3 -m pytest tests/unit/python -q
+
+  # Static analysis / pre-commit checks. Docker is preinstalled on
+  # ubuntu-latest runners, which is all this script needs.
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run static checks
+        run: scripts/pre-commit-static-checks.sh
