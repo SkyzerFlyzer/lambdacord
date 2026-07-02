@@ -247,7 +247,16 @@ def make_full_valid_module(make_module):
     return make_module(
         "demo",
         full_valid_manifest(),
-        commands=[{"name": "demo", "description": "d"}],
+        # The "demo hello" route derives from a "hello" subcommand under "demo",
+        # keeping the schema, route, and Lambda folder mutually consistent
+        # (enforced by check_route_consistency, T4.2).
+        commands=[
+            {
+                "name": "demo",
+                "description": "d",
+                "options": [{"name": "hello", "description": "h", "type": 1}],
+            }
+        ],
         errors={"errors": {"some_code": {"message": "friendly copy"}}},
         lambda_mains=[
             "lambdas/commands/discord-cmd-demo-hello",

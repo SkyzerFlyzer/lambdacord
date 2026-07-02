@@ -1,4 +1,5 @@
 import json
+import sys
 import unicodedata
 from pathlib import Path
 
@@ -361,9 +362,258 @@ def command_count_by_module(repo_root: Path):
     return counts
 
 
+# ---------------------------------------------------------------------------
+# Route <-> schema <-> Lambda-folder consistency (T4.2)
+#
+# The "naming convention is load-bearing": the application-command handler
+# derives the target Lambda name mechanically from a command path
+# (`<group> <subcommand>` -> `discord-cmd-<group>-<subcommand>`). This check
+# catches drift between a module's command schema, its manifest route map, and
+# the Lambda folders on disk before a live registration/deploy. Errors join the
+# same aggregation as `validate_module_manifests`; an unreferenced Lambda folder
+# is surfaced as a WARNING (returned separately, never a validation failure).
+# ---------------------------------------------------------------------------
+
+
+def _route_target_name(value):
+    """Return the target Lambda name for a manifest route value.
+
+    Tolerates both the plain-string form (``"discord-cmd-foo"``) and the
+    object form (``{"lambda": "discord-cmd-foo", ...}``) that a future
+    route-config task may introduce, without a hard dependency on it.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        lam = value.get("lambda")
+        if isinstance(lam, str):
+            return lam
+    return None
+
+
+def _collect_schema_paths_and_autocompletes(commands):
+    """Derive chat-input command paths and autocomplete option targets.
+
+    Mirrors the application-command handler's derivation exactly: a CHAT_INPUT
+    command contributes a path only when it is nested (a subcommand) or has no
+    subcommand/group options; groups (type 2) and subcommands (type 1) are
+    walked to their leaves. Returns ``(paths, autocompletes)`` where ``paths``
+    is a set of space-joined command paths and ``autocompletes`` is a list of
+    ``(path, option_name)`` pairs for options flagged ``"autocomplete": true``.
+    """
+    paths = set()
+    autocompletes = []
+
+    def walk(command_list, prefix):
+        for command in command_list:
+            if not isinstance(command, dict):
+                continue
+            name = command.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            ctype = command.get("type", _CMD_CHAT_INPUT)
+            current = [*prefix, name]
+            options = command.get("options", [])
+            if not isinstance(options, list):
+                options = []
+            sub_options = [
+                option
+                for option in options
+                if isinstance(option, dict)
+                and option.get("type") in (_OPT_SUBCOMMAND, _OPT_SUBCOMMAND_GROUP)
+            ]
+
+            if ctype == _CMD_CHAT_INPUT and (prefix or not sub_options):
+                path = " ".join(current)
+                paths.add(path)
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    if option.get("type") in (_OPT_SUBCOMMAND, _OPT_SUBCOMMAND_GROUP):
+                        continue
+                    if option.get("autocomplete") is True:
+                        oname = option.get("name")
+                        if isinstance(oname, str) and oname:
+                            autocompletes.append((path, oname))
+
+            for option in options:
+                if isinstance(option, dict) and option.get("type") in (
+                    _OPT_SUBCOMMAND,
+                    _OPT_SUBCOMMAND_GROUP,
+                ):
+                    walk([option], current)
+
+    walk(commands, [])
+    return paths, autocompletes
+
+
+def _existing_folder_basenames(module):
+    """Basenames of the module's declared Lambda folders that exist on disk."""
+    module_dir = module["dir"]
+    existing = set()
+    for rel in module["manifest"].get("lambdas", []):
+        if isinstance(rel, str) and rel and (module_dir / rel / "main.cpp").exists():
+            existing.add(Path(rel).name)
+    return existing
+
+
+def _route_targets(mapping):
+    """Return the dict of ``route -> target-name`` for a manifest route map."""
+    targets = {}
+    if isinstance(mapping, dict):
+        for route, value in mapping.items():
+            if isinstance(route, str) and route:
+                targets[route] = _route_target_name(value)
+    return targets
+
+
+def check_route_consistency(modules):
+    """Cross-check command schemas, manifest routes, and Lambda folders.
+
+    ``modules`` is the list returned by :func:`discover_modules`. Returns
+    ``{"errors": [...], "warnings": [...]}`` with every message prefixed by the
+    owning module name. Errors are hard consistency failures; warnings flag an
+    unreferenced Lambda folder without failing validation.
+
+    Schema/command-route consistency is enforced for a module once it declares
+    at least one command route (i.e. it has opted into routing); a module with a
+    schema but no command routes is treated as not-yet-wired and only its
+    autocomplete and orphan-folder checks run. Context-menu route kinds
+    (``user_commands`` / ``message_commands``) are validated when present and
+    tolerated when absent, so this check does not hard-depend on T3.1.
+    """
+    errors = []
+    warnings = []
+
+    for module in modules:
+        manifest = module["manifest"]
+        module_name = manifest.get("name", "module")
+        prefix = f"{module_name}:"
+
+        commands = _load_module_commands_optional(module)
+        if commands is None:
+            continue
+
+        routes = manifest.get("routes", {})
+        if not isinstance(routes, dict):
+            routes = {}
+
+        existing_folders = _existing_folder_basenames(module)
+        schema_paths, autocompletes = _collect_schema_paths_and_autocompletes(commands)
+
+        command_routes = _route_targets(routes.get("commands", {}))
+
+        # Schema -> route -> folder. Only enforced once the module declares a
+        # command route (see the docstring): a route-less schema is not-yet-wired.
+        if command_routes:
+            for path in sorted(schema_paths):
+                derived = "discord-cmd-" + path.replace(" ", "-")
+                if path not in command_routes:
+                    errors.append(
+                        f"{prefix} command schema path {path!r} has no commands route entry"
+                    )
+                    continue
+                target = command_routes[path]
+                if target != derived:
+                    errors.append(
+                        f"{prefix} commands route {path!r} points to {target!r} "
+                        f"but the derived Lambda name is {derived!r}"
+                    )
+                if target not in existing_folders:
+                    errors.append(
+                        f"{prefix} commands route {path!r} target Lambda folder "
+                        f"{target!r} does not exist in the module"
+                    )
+
+            # Route -> schema (reverse).
+            for path in sorted(command_routes):
+                if path not in schema_paths:
+                    errors.append(
+                        f"{prefix} commands route {path!r} has no matching command in the schema"
+                    )
+
+        # Autocomplete options must have a matching autocomplete route.
+        autocomplete_targets = set(
+            filter(None, _route_targets(routes.get("autocomplete", {})).values())
+        )
+        for path, option_name in autocompletes:
+            derived = f"discord-autocomplete-{path.replace(' ', '-')}-{option_name}"
+            if derived not in autocomplete_targets:
+                errors.append(
+                    f"{prefix} autocomplete option {option_name!r} on command {path!r} "
+                    f"has no route {derived!r}"
+                )
+
+        # Context-menu route kinds (validate if present, tolerate absent).
+        for kind, kind_prefix, cmd_type in (
+            ("user_commands", "discord-usercmd-", _CMD_USER),
+            ("message_commands", "discord-msgcmd-", _CMD_MESSAGE),
+        ):
+            kind_routes = _route_targets(routes.get(kind, {}))
+            if not kind_routes:
+                continue
+            schema_names = {
+                command.get("name")
+                for command in commands
+                if isinstance(command, dict)
+                and command.get("type") == cmd_type
+                and isinstance(command.get("name"), str)
+            }
+            for cmd_name in sorted(schema_names):
+                derived = kind_prefix + cmd_name.lower().replace(" ", "-")
+                if cmd_name not in kind_routes:
+                    errors.append(
+                        f"{prefix} {kind} schema command {cmd_name!r} has no route entry"
+                    )
+                    continue
+                target = kind_routes[cmd_name]
+                if target != derived:
+                    errors.append(
+                        f"{prefix} {kind} route {cmd_name!r} points to {target!r} "
+                        f"but the derived Lambda name is {derived!r}"
+                    )
+                if target not in existing_folders:
+                    errors.append(
+                        f"{prefix} {kind} route {cmd_name!r} target Lambda folder "
+                        f"{target!r} does not exist in the module"
+                    )
+            for route_name in sorted(kind_routes):
+                if route_name not in schema_names:
+                    errors.append(
+                        f"{prefix} {kind} route {route_name!r} has no matching command in the schema"
+                    )
+
+        # Orphan Lambda folders -> warning. A folder is referenced if any route
+        # kind targets it, or the error mapper points at it.
+        referenced = set()
+        for route_kind in (
+            "commands",
+            "components",
+            "modals",
+            "autocomplete",
+            "user_commands",
+            "message_commands",
+        ):
+            referenced.update(filter(None, _route_targets(routes.get(route_kind, {})).values()))
+        error_mapper = manifest.get("error_mapper", {})
+        if isinstance(error_mapper, dict):
+            mapper_path = error_mapper.get("path")
+            if isinstance(mapper_path, str) and mapper_path:
+                referenced.add(Path(mapper_path).name)
+
+        for rel in manifest.get("lambdas", []):
+            if isinstance(rel, str) and rel and Path(rel).name not in referenced:
+                warnings.append(
+                    f"{prefix} Lambda folder {rel!r} is not referenced by any route"
+                )
+
+    return {"errors": errors, "warnings": warnings}
+
+
 def validate_module_manifests(repo_root: Path):
     problems = []
-    for module in discover_modules(repo_root):
+    modules = discover_modules(repo_root)
+    for module in modules:
         manifest = module["manifest"]
         module_dir = module["dir"]
         routes = manifest.get("routes", {})
@@ -410,6 +660,13 @@ def validate_module_manifests(repo_root: Path):
         commands = _load_module_commands_optional(module)
         if commands is not None:
             problems.extend(validate_command_schema(commands, manifest["name"]))
+
+    # Route <-> schema <-> Lambda-folder consistency (T4.2). Errors join the
+    # aggregation; warnings are surfaced to stderr without failing validation.
+    consistency = check_route_consistency(modules)
+    problems.extend(consistency["errors"])
+    for warning in consistency["warnings"]:
+        print(f"WARNING: {warning}", file=sys.stderr)
 
     if problems:
         raise ModuleError("; ".join(problems))
