@@ -21,6 +21,7 @@ inline constexpr int response_deferred_update_message = 6;
 inline constexpr int response_update_message = 7;
 inline constexpr int response_autocomplete_result = 8;
 inline constexpr int response_modal = 9;
+inline constexpr int response_premium_required = 10;  // DEPRECATED by Discord — use premium_button instead
 
 inline size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     auto* out = reinterpret_cast<std::string*>(userdata);
