@@ -148,6 +148,15 @@ TEST_CASE("limits constants match Discord's documented values") {
     CHECK(limits::text_input_value == 4000);
     CHECK(limits::components_per_message == 40);
     CHECK(limits::text_display_content == 4000);
+    // Modal top-level cap is 5 (NOT the 40-component message cap).
+    CHECK(limits::modal_components == 5);
+    CHECK(limits::button_label == 80);
+    CHECK(limits::select_option_field == 100);
+    CHECK(limits::label_description == 100);
+    CHECK(limits::text_input_placeholder == 100);
+    CHECK(limits::radio_options_min == 2);
+    CHECK(limits::radio_options_max == 10);
+    CHECK(limits::checkbox_group_max_values == 10);
 }
 
 TEST_CASE("limits constants are constexpr size_t usable at compile time") {

@@ -81,9 +81,38 @@ TEST_CASE("radio_group emits type 21 with options and required, plus a default o
 
 TEST_CASE("radio_group honors required=false and clamps custom_id") {
     const std::string long_id(150, 'r');
-    const json group = radio_group(long_id, json::array({radio_option("a", "a")}), false);
+    const json group = radio_group(
+        long_id, json::array({radio_option("a", "a"), radio_option("b", "b")}), false);
     CHECK(group["required"] == false);
     CHECK(group["custom_id"].get<std::string>().size() <= 100u);
+}
+
+TEST_CASE("radio_group rejects fewer than 2 options") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(radio_group("r", json::array({radio_option("a", "a")})),
+                    ModuleError);
+    // A non-array options value is also rejected.
+    CHECK_THROWS_AS(radio_group("r", json::object()), ModuleError);
+}
+
+TEST_CASE("radio_group rejects more than 10 options") {
+    using discord_interactions::ModuleError;
+    json options = json::array();
+    for (int i = 0; i < 11; ++i) {
+        options.push_back(radio_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    CHECK_THROWS_AS(radio_group("r", options), ModuleError);
+}
+
+TEST_CASE("radio_group accepts exactly 2 and exactly 10 options") {
+    using discord_interactions::radio_group;
+    CHECK_NOTHROW(
+        radio_group("r", json::array({radio_option("a", "a"), radio_option("b", "b")})));
+    json ten = json::array();
+    for (int i = 0; i < 10; ++i) {
+        ten.push_back(radio_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    CHECK_NOTHROW(radio_group("r", ten));
 }
 
 // ---------------------------------------------------------------------------
@@ -112,23 +141,53 @@ TEST_CASE("checkbox_group emits min_values/max_values when supplied") {
     CHECK(group["max_values"] == 3);
 }
 
+TEST_CASE("checkbox_group rejects min_values > max_values") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 3, 1),
+        ModuleError);
+}
+
+TEST_CASE("checkbox_group rejects a negative min or max other than the -1 sentinel") {
+    using discord_interactions::ModuleError;
+    // -1 means "omit"; -2 is an out-of-range value.
+    CHECK_THROWS_AS(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, -2, 3),
+        ModuleError);
+}
+
+TEST_CASE("checkbox_group rejects max_values above limits::checkbox_group_max_values") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 0, 11),
+        ModuleError);
+}
+
+TEST_CASE("checkbox_group accepts a boundary 0..10 range") {
+    CHECK_NOTHROW(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 0, 10));
+}
+
 // ---------------------------------------------------------------------------
 // Factory: Checkbox (type 23)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("checkbox emits type 23 with required default false and no default key") {
+TEST_CASE("checkbox emits type 23 and NEVER emits a required field") {
     const json box = checkbox("agree");
     CHECK(box["type"] == 23);
     CHECK(box["custom_id"] == "agree");
-    CHECK(box["required"] == false);
+    // Standalone Checkbox: the docs are ambiguous about a "required" field, so
+    // it is never emitted (Discord's default applies if the field exists).
+    CHECK_FALSE(box.contains("required"));
     CHECK_FALSE(box.contains("default"));
     // The checkbox's visible text is supplied by its Label wrapper.
     CHECK_FALSE(box.contains("label"));
 }
 
-TEST_CASE("checkbox emits default when checked-by-default and honors required=true") {
+TEST_CASE("checkbox never emits required even when the required param is set") {
+    // The required parameter is retained for source compatibility but ignored.
     const json box = checkbox("terms", true, true);
-    CHECK(box["required"] == true);
+    CHECK_FALSE(box.contains("required"));
     CHECK(box["default"] == true);
 }
 
@@ -274,7 +333,7 @@ TEST_CASE("extraction works over a real-shaped multi-input MODAL_SUBMIT fixture"
 // Composition: a modal with one of each input type
 // ---------------------------------------------------------------------------
 
-TEST_CASE("modal composes one of each input type wrapped in Labels and stays <= 40") {
+TEST_CASE("modal composes one of each input type wrapped in Labels and fits in 5") {
     const json response = modal("everything", "All Inputs", {
         label_component("Feedback", text_input("fb", TextInputStyle::paragraph)),
         label_component("Resume", file_upload("resume")),
@@ -287,7 +346,7 @@ TEST_CASE("modal composes one of each input type wrapped in Labels and stays <= 
     CHECK(response["type"] == 9);
     REQUIRE(response["data"]["components"].is_array());
     CHECK(response["data"]["components"].size() == 5);
-    CHECK(response["data"]["components"].size() <= 40u);
+    CHECK(response["data"]["components"].size() <= 5u);
     // Every child is Label-wrapped (type 18) and no deprecated action row is present.
     for (const auto& child : response["data"]["components"]) {
         CHECK(child["type"] == 18);

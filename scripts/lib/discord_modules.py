@@ -318,10 +318,27 @@ def _check_options(options, container_type, subject: str, problems):
             _check_choices(option, opt_subject, problems)
 
 
+_COMMAND_TYPES = frozenset((_CMD_CHAT_INPUT, _CMD_USER, _CMD_MESSAGE))
+
+
 def _check_command(command, module_name: str, problems):
     name = command.get("name")
-    ctype = command.get("type", _CMD_CHAT_INPUT)
     subject = f"{module_name}: command {name!r}"
+
+    # Top-level command type: absent means CHAT_INPUT (Discord defaults to 1);
+    # when present it must be an integer in {1, 2, 3}. bool is an int subclass in
+    # Python, so it is rejected as a non-integer (mirrors the option-type check).
+    raw_type = command.get("type")
+    if raw_type is None:
+        ctype = _CMD_CHAT_INPUT
+    elif not isinstance(raw_type, int) or isinstance(raw_type, bool):
+        problems.append(f"{subject} command type must be an integer")
+        return
+    elif raw_type not in _COMMAND_TYPES:
+        problems.append(f"{subject} has unsupported command type {raw_type!r}")
+        return
+    else:
+        ctype = raw_type
 
     if ctype in (_CMD_USER, _CMD_MESSAGE):
         # Context menu commands: 1-32 char name (mixed case + spaces allowed),

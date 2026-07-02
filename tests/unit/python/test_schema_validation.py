@@ -163,6 +163,37 @@ class TestContextMenuCommands:
 
 
 # ---------------------------------------------------------------------------
+# Top-level command type: absent = chat-input; present must be int in {1,2,3}
+# ---------------------------------------------------------------------------
+
+
+class TestCommandType:
+    def test_accepts_absent_type_as_chat_input(self):
+        # Discord defaults an absent type to CHAT_INPUT (1).
+        assert problems_for([{"name": "ping", "description": "d"}]) == ""
+
+    def test_accepts_explicit_type_1(self):
+        assert problems_for([{"name": "ping", "type": 1, "description": "d"}]) == ""
+
+    def test_accepts_type_2_and_3(self):
+        assert problems_for([{"name": "Report User", "type": 2}]) == ""
+        assert problems_for([{"name": "Pin Message", "type": 3}]) == ""
+
+    def test_rejects_unsupported_integer_type(self):
+        msg = problems_for([{"name": "cmd", "type": 4, "description": "d"}])
+        assert "unsupported command type" in msg
+
+    def test_rejects_non_integer_type(self):
+        msg = problems_for([{"name": "cmd", "type": "1", "description": "d"}])
+        assert "command type must be an integer" in msg
+
+    def test_rejects_boolean_type(self):
+        # bool is an int subclass in Python; it must not be accepted as type 1.
+        msg = problems_for([{"name": "cmd", "type": True, "description": "d"}])
+        assert "command type must be an integer" in msg
+
+
+# ---------------------------------------------------------------------------
 # Option names: valid + unique per level
 # ---------------------------------------------------------------------------
 

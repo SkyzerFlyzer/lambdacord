@@ -71,6 +71,28 @@ TEST_CASE("button custom_id clamped to 100 chars") {
     CHECK(clamped.size() < long_id.size());
 }
 
+TEST_CASE("button label clamped to limits::button_label (80)") {
+    const std::string long_label(250, 'L');
+    const json b = button(ButtonStyle::primary, "id", long_label);
+    const std::string clamped = b["label"].get<std::string>();
+    CHECK(clamped.size() <= 80);
+    CHECK(clamped.size() < long_label.size());
+}
+
+TEST_CASE("select_option clamps label, value and description to 100 chars") {
+    const std::string long_label(250, 'L');
+    const std::string long_value(250, 'v');
+    const std::string long_desc(250, 'd');
+    const json opt = select_option(long_label, long_value, long_desc);
+    CHECK(opt["label"].get<std::string>().size() <= 100);
+    CHECK(opt["value"].get<std::string>().size() <= 100);
+    CHECK(opt["description"].get<std::string>().size() <= 100);
+    // The value is machine-facing: clamped WITHOUT an ellipsis (no "…").
+    CHECK(opt["value"].get<std::string>().find("\xE2\x80\xA6") == std::string::npos);
+    // label/description clamp with safe_truncate, which appends the ellipsis.
+    CHECK(opt["label"].get<std::string>().find("\xE2\x80\xA6") != std::string::npos);
+}
+
 TEST_CASE("string_select shape with defaults omitted") {
     const json options = json::array({select_option("One", "1"), select_option("Two", "2")});
     const json s = string_select("pick", options);

@@ -47,6 +47,21 @@ inline constexpr std::size_t custom_id = 100;
 inline constexpr std::size_t modal_title = 45;
 inline constexpr std::size_t text_input_label = 45;
 inline constexpr std::size_t text_input_value = 4000;
+inline constexpr std::size_t text_input_placeholder = 100;
+// A modal callback carries 1..5 top-level components ("Between 1 and 5
+// (inclusive) components that make up the modal", receiving-and-responding
+// docs). This is DISTINCT from the 40-component message cap below.
+inline constexpr std::size_t modal_components = 5;
+inline constexpr std::size_t label_description = 100;
+
+// Radio Group / Checkbox Group option and value bounds.
+inline constexpr std::size_t radio_options_min = 2;
+inline constexpr std::size_t radio_options_max = 10;
+inline constexpr std::size_t checkbox_group_max_values = 10;
+
+// Button label and select-option field caps.
+inline constexpr std::size_t button_label = 80;
+inline constexpr std::size_t select_option_field = 100;
 
 // Components v2 message layout.
 inline constexpr std::size_t components_per_message = 40;

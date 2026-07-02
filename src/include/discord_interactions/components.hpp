@@ -27,6 +27,28 @@ namespace discord_interactions {
 
 using json = nlohmann::json;
 
+namespace components_detail {
+
+// UTF-8-safe, no-ellipsis clamp for machine-facing values. Mirrors
+// autocomplete.hpp's clamp_value_no_ellipsis: a select-option value is an
+// identifier the client echoes back verbatim on selection, so an appended "…"
+// would corrupt it. Clamps to at most `max_bytes`, retreating to a UTF-8
+// codepoint boundary so a multibyte sequence is never split, appending nothing.
+inline std::string clamp_value_no_ellipsis(const std::string& text,
+                                           std::size_t max_bytes) {
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+    std::size_t keep = max_bytes;
+    while (keep > 0 &&
+           (static_cast<unsigned char>(text[keep]) & 0xC0) == 0x80) {
+        --keep;
+    }
+    return text.substr(0, keep);
+}
+
+}  // namespace components_detail
+
 enum class ButtonStyle {
     primary = 1,
     secondary = 2,
@@ -45,7 +67,7 @@ inline json button(ButtonStyle style, const std::string& custom_id_or_url,
     json result = json::object();
     result["type"] = 2;
     result["style"] = static_cast<int>(style);
-    result["label"] = label;
+    result["label"] = safe_truncate(label, limits::button_label);
     if (style == ButtonStyle::link) {
         result["url"] = custom_id_or_url;
     } else {
@@ -60,16 +82,21 @@ inline json button(ButtonStyle style, const std::string& custom_id_or_url,
     return result;
 }
 
-// A single option for a string select (used inside `string_select`).
-// `description` and `default` are emitted only when non-default.
+// A single option for a string select (used inside `string_select`). `label`,
+// `value`, and `description` each clamp to limits::select_option_field (100).
+// `label` and `description` clamp with safe_truncate (appending an ellipsis);
+// `value` is machine-facing (echoed back verbatim on selection) so it clamps
+// WITHOUT an ellipsis. `description` and `default` are emitted only when
+// non-default.
 inline json select_option(const std::string& label, const std::string& value,
                           const std::string& description = "",
                           bool is_default = false) {
     json result = json::object();
-    result["label"] = label;
-    result["value"] = value;
+    result["label"] = safe_truncate(label, limits::select_option_field);
+    result["value"] =
+        components_detail::clamp_value_no_ellipsis(value, limits::select_option_field);
     if (!description.empty()) {
-        result["description"] = description;
+        result["description"] = safe_truncate(description, limits::select_option_field);
     }
     if (is_default) {
         result["default"] = true;

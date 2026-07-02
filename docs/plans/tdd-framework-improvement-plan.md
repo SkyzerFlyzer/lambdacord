@@ -386,7 +386,10 @@ Task ID format: `T<phase>.<n>`.
              std::initializer_list<json> components);
       // components must be modal-legal top-level types (Label-wrapped inputs, or
       // Text Display type 10); throws ModuleError(validation) on a bare text
-      // input (unwrapped) or on count > 40 (limits::components_per_message).
+      // input (unwrapped) or on count outside 1..5 (limits::modal_components).
+      // REVIEW FOLLOW-UP: the original spec wrongly reused the 40-component
+      // message cap here; Discord's modal callback allows 1..5 top-level
+      // components. Corrected to limits::modal_components (5).
   // Extraction from a MODAL_SUBMIT interaction (recurses through Label wrappers):
   std::optional<std::string> modal_value(const json& interaction, const std::string& custom_id);
   ```
@@ -394,7 +397,8 @@ Task ID format: `T<phase>.<n>`.
 - **Test specification:** ≥ 12 cases: input JSON shape per style; optional fields
   omitted when defaulted; no `label` key on the text input itself; Label wrapper
   shape with and without description; title/label clamped via limits; bare
-  text-input rejection; >40 components throws; no type-1 action rows anywhere in
+  text-input rejection; >5 components throws (review follow-up: modal cap is
+  limits::modal_components = 5, not 40); no type-1 action rows anywhere in
   the emitted modal; `modal_value` finds a value nested under a Label wrapper,
   returns nullopt when absent; real-shaped MODAL_SUBMIT fixture using the
   Label-wrapped structure.

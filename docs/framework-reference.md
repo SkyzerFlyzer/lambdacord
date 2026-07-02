@@ -319,8 +319,13 @@ inline constexpr std::size_t content = 2000, embed_title = 256, embed_descriptio
     embed_author = 256, embed_total = 6000, embeds_per_message = 10, action_rows = 5,
     buttons_per_row = 5, select_options = 25, autocomplete_choices = 25, choice_name = 100,
     custom_id = 100, modal_title = 45, text_input_label = 45, text_input_value = 4000,
+    text_input_placeholder = 100, modal_components = 5, label_description = 100,
+    radio_options_min = 2, radio_options_max = 10, checkbox_group_max_values = 10,
+    button_label = 80, select_option_field = 100,
     components_per_message = 40, text_display_content = 4000;
 }
+// modal_components (5) is Discord's modal top-level cap (1..5); it is DISTINCT
+// from components_per_message (40), the message-component cap.
 // Never splits a multibyte UTF-8 sequence; appends "…" within the byte budget.
 std::string safe_truncate(const std::string& text, std::size_t max_bytes);
 ```
@@ -415,7 +420,12 @@ Modal interaction responses and modal-submit value extraction. Emits Discord's
 CURRENT Label-wrapper layout (Label type 18 wrapping a bare input); the deprecated
 Action-Row-with-Text-Input layout is never emitted. `modal()` returns the full
 `{type:9, data:{...}}` response and accepts only Label (18) / Text Display (10) at
-the top level.
+the top level, requiring 1..`limits::modal_components` (5) of them (Discord's modal
+cap, distinct from the 40-component message cap). `label_component()` clamps the
+description to `limits::label_description` and rejects a non-input child
+(`invalid_label_child`); `radio_group()` requires 2..10 options and
+`checkbox_group()` validates `0 <= min <= max <= 10`; `checkbox()` never emits a
+`required` field.
 
 ```cpp
 enum class TextInputStyle { short_input = 1, paragraph = 2 };

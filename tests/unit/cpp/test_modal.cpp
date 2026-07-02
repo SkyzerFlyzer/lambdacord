@@ -156,24 +156,59 @@ TEST_CASE("modal rejects a bare text input passed directly") {
     }
 }
 
-TEST_CASE("modal rejects more than 40 components") {
+TEST_CASE("modal rejects more than 5 components") {
     const json label = label_component("L", text_input("a", TextInputStyle::short_input));
-    // 41 Label components exceeds limits::components_per_message (40).
-    CHECK_THROWS_AS(
-        modal("m", "T",
-              {label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label,
-               label}),
-        ModuleError);
-    // Exactly 40 is legal.
-    CHECK_NOTHROW(
-        modal("m", "T",
-              {label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label,
-               label, label, label, label, label, label, label, label, label, label}));
+    // 6 Label components exceeds limits::modal_components (5) — modals allow 1..5.
+    CHECK_THROWS_AS(modal("m", "T", {label, label, label, label, label, label}),
+                    ModuleError);
+    // Exactly 5 is legal.
+    CHECK_NOTHROW(modal("m", "T", {label, label, label, label, label}));
+}
+
+TEST_CASE("modal rejects an empty component list (needs at least 1)") {
+    CHECK_THROWS_AS(modal("m", "T", {}), ModuleError);
+    try {
+        modal("m", "T", {});
+    } catch (const ModuleError& e) {
+        CHECK(e.category == discord_interactions::ErrorCategory::validation);
+    }
+}
+
+TEST_CASE("label_component clamps description to limits::label_description") {
+    const std::string long_desc(200, 'D');
+    const json child = text_input("id", TextInputStyle::short_input);
+    const json label = label_component("L", child, long_desc);
+    CHECK(label["description"].get<std::string>().size() <= 100u);
+}
+
+TEST_CASE("label_component rejects a non-input child (button type 2)") {
+    const json btn = json{{"type", 2}, {"style", 1}, {"label", "Click"},
+                          {"custom_id", "x"}};
+    CHECK_THROWS_AS(label_component("L", btn), ModuleError);
+    try {
+        label_component("L", btn);
+    } catch (const ModuleError& e) {
+        CHECK(e.code == "invalid_label_child");
+        CHECK(e.category == discord_interactions::ErrorCategory::validation);
+    }
+}
+
+TEST_CASE("label_component rejects a deprecated action row child (type 1)") {
+    const json row = json{{"type", 1}, {"components", json::array()}};
+    CHECK_THROWS_AS(label_component("L", row), ModuleError);
+}
+
+TEST_CASE("label_component accepts a select-menu child (type 3)") {
+    const json select = json{{"type", 3}, {"custom_id", "pick"},
+                             {"options", json::array()}};
+    CHECK_NOTHROW(label_component("L", select));
+}
+
+TEST_CASE("text_input clamps placeholder to limits::text_input_placeholder") {
+    const std::string long_placeholder(200, 'p');
+    const json input = text_input("id", TextInputStyle::short_input, true,
+                                  long_placeholder);
+    CHECK(input["placeholder"].get<std::string>().size() <= 100u);
 }
 
 TEST_CASE("modal emits no deprecated type-1 action rows anywhere") {
