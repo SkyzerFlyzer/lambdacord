@@ -41,14 +41,28 @@ enum class TextInputStyle {
 // lives on the enclosing Label component (see label_component). Optional fields
 // (placeholder, value, min_length, max_length) are omitted when left at their
 // defaults; max_length == 0 means "omit". custom_id clamps to limits::custom_id
-// and value clamps to limits::text_input_value.
+// via clamp_utf8 (machine-facing, no ellipsis) and value clamps to
+// limits::text_input_value. Documented length ranges are enforced: min_length
+// must be 0..limits::text_input_value (4000), a set max_length must be
+// 1..limits::text_input_value, and min_length <= max_length when both are set;
+// violations throw ModuleError(code="invalid_text_input_length", validation).
 inline json text_input(const std::string& custom_id, TextInputStyle style,
                        bool required = true, const std::string& placeholder = "",
                        const std::string& value = "",
                        int min_length = 0, int max_length = 0) {
+    const int length_cap = static_cast<int>(limits::text_input_value);
+    if (min_length < 0 || min_length > length_cap || max_length < 0 ||
+        max_length > length_cap ||
+        (max_length != 0 && min_length > max_length)) {
+        throw MODULE_ERROR("invalid_text_input_length", ErrorCategory::validation,
+                           "text input requires min_length 0.." +
+                               std::to_string(length_cap) + ", max_length 1.." +
+                               std::to_string(length_cap) +
+                               " when set, and min_length <= max_length");
+    }
     json input = json::object();
     input["type"] = 4;
-    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     input["style"] = static_cast<int>(style);
     input["required"] = required;
 
@@ -119,12 +133,13 @@ inline json label_component(const std::string& label, const json& child,
 // field is omitted when left at its default so payloads stay minimal.
 // ---------------------------------------------------------------------------
 
-// File Upload (component type 19). On MODAL_SUBMIT the uploaded files arrive as
-// an "attachment_ids" array of snowflakes (extract with modal_values).
+// File Upload (component type 19). On MODAL_SUBMIT the uploaded attachment
+// snowflakes arrive as a "values" array — the same key a Checkbox Group uses
+// (extract with modal_values).
 inline json file_upload(const std::string& custom_id, bool required = true) {
     json input = json::object();
     input["type"] = 19;
-    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     input["required"] = required;
     return input;
 }
@@ -163,7 +178,7 @@ inline json radio_group(const std::string& custom_id, const json& options,
     }
     json input = json::object();
     input["type"] = 21;
-    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     input["options"] = options;
     input["required"] = required;
     return input;
@@ -171,28 +186,45 @@ inline json radio_group(const std::string& custom_id, const json& options,
 
 // Checkbox Group (component type 22) — a multi-choice list. On MODAL_SUBMIT the
 // selected option values arrive as a "values" array (extract with modal_values).
+// `options` must be an array of limits::checkbox_group_options_min (1) to
+// limits::checkbox_group_options_max (10) entries; a non-array, empty, or
+// oversized list throws ModuleError(code="invalid_checkbox_options", validation).
 // min_values / max_values are ADDITIVE optional fields; -1 (the default) means
 // "omit". When either is set (!= -1) it must satisfy
-// 0 <= min <= max <= limits::checkbox_group_max_values (10); a value that
-// violates that (including a negative other than the -1 sentinel, or min > max)
-// throws ModuleError(code="invalid_checkbox_values", validation).
+// 0 <= min <= max <= limits::checkbox_group_max_values (10), a set max_values
+// must additionally be >= 1, and when required == true a set min_values must be
+// >= 1 (a required group cannot allow zero selections). Violations throw
+// ModuleError(code="invalid_checkbox_values", validation).
 inline json checkbox_group(const std::string& custom_id, const json& options,
                            bool required = true, int min_values = -1,
                            int max_values = -1) {
+    if (!options.is_array() ||
+        options.size() < limits::checkbox_group_options_min ||
+        options.size() > limits::checkbox_group_options_max) {
+        throw MODULE_ERROR("invalid_checkbox_options", ErrorCategory::validation,
+                           "checkbox group must have between " +
+                               std::to_string(limits::checkbox_group_options_min) +
+                               " and " +
+                               std::to_string(limits::checkbox_group_options_max) +
+                               " options");
+    }
     const int max_cap = static_cast<int>(limits::checkbox_group_max_values);
     const bool min_set = min_values != -1;
     const bool max_set = max_values != -1;
     if ((min_set && (min_values < 0 || min_values > max_cap)) ||
-        (max_set && (max_values < 0 || max_values > max_cap)) ||
-        (min_set && max_set && min_values > max_values)) {
+        (max_set && (max_values < 1 || max_values > max_cap)) ||
+        (min_set && max_set && min_values > max_values) ||
+        (required && min_set && min_values < 1)) {
         throw MODULE_ERROR("invalid_checkbox_values", ErrorCategory::validation,
                            "checkbox group min/max_values must satisfy 0 <= min <= max <= " +
-                               std::to_string(max_cap));
+                               std::to_string(max_cap) +
+                               ", with a set max_values >= 1 and a set min_values >= 1 "
+                               "when the group is required");
     }
     json input = json::object();
     input["type"] = 22;
-    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
-    input["options"] = options.is_array() ? options : json::array();
+    input["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
+    input["options"] = options;
     input["required"] = required;
     if (min_set) {
         input["min_values"] = min_values;
@@ -220,7 +252,7 @@ inline json checkbox(const std::string& custom_id, bool required = false,
     (void)required;  // intentionally unused; see the NOTE above.
     json input = json::object();
     input["type"] = 23;
-    input["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    input["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     if (is_default) {
         input["default"] = true;
     }
@@ -267,7 +299,7 @@ inline json modal(const std::string& custom_id, const std::string& title,
     }
 
     json data = json::object();
-    data["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    data["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     data["title"] = safe_truncate(title, limits::modal_title);
     data["components"] = std::move(component_array);
 
@@ -310,7 +342,8 @@ inline std::optional<std::string> find_modal_value(const json& node,
 }
 
 // Depth-first collection of the string elements of a submitted component's
-// multi-value field (checkbox-group "values" or file-upload "attachment_ids").
+// "values" array — the documented multi-value submit key for both a Checkbox
+// Group (selected option values) and a File Upload (attachment snowflakes).
 // Recurses through Label wrappers and nested arrays; stops at the first object
 // whose "custom_id" matches (custom_ids are unique within a modal).
 inline void collect_modal_values(const json& node, const std::string& custom_id,
@@ -319,13 +352,11 @@ inline void collect_modal_values(const json& node, const std::string& custom_id,
         const auto id_it = node.find("custom_id");
         if (id_it != node.end() && id_it->is_string() &&
             id_it->get<std::string>() == custom_id) {
-            for (const char* key : {"values", "attachment_ids"}) {
-                const auto arr_it = node.find(key);
-                if (arr_it != node.end() && arr_it->is_array()) {
-                    for (const auto& element : *arr_it) {
-                        if (element.is_string()) {
-                            out.push_back(element.get<std::string>());
-                        }
+            const auto arr_it = node.find("values");
+            if (arr_it != node.end() && arr_it->is_array()) {
+                for (const auto& element : *arr_it) {
+                    if (element.is_string()) {
+                        out.push_back(element.get<std::string>());
                     }
                 }
             }
@@ -392,10 +423,10 @@ inline std::optional<std::string> modal_value(const json& interaction,
 }
 
 // Extracts a submitted multi-value field from a MODAL_SUBMIT interaction by
-// custom_id, recursing through Label wrappers. Returns the selected values of a
-// Checkbox Group ("values") or the uploaded attachment ids of a File Upload
-// ("attachment_ids"). Returns an empty vector when the input is absent or has no
-// such array.
+// custom_id, recursing through Label wrappers. Both a Checkbox Group (selected
+// option values) and a File Upload (uploaded attachment snowflakes) submit
+// under the documented "values" key. Returns an empty vector when the input is
+// absent or has no such array.
 inline std::vector<std::string> modal_values(const json& interaction,
                                              const std::string& custom_id) {
     std::vector<std::string> out{};

@@ -8,7 +8,9 @@
 // *SelectMenuBuilder surface within this framework's stateless model. They emit
 // plain nlohmann::json so unit tests and Lambdas consume them identically
 // (AD-2). Header-only, standard library plus nlohmann/json and the framework's
-// limits.hpp / errors.hpp only (AD-7).
+// limits.hpp / errors.hpp / json_access.hpp only (AD-7). custom_ids and select
+// values are machine-facing and clamp through limits.hpp's clamp_utf8 (never
+// the ellipsis-appending safe_truncate).
 //
 // Component type codes emitted here follow Discord's reference: action row 1,
 // button 2, string select 3, user select 5, role select 6, channel select 8.
@@ -21,33 +23,12 @@
 #include <string>
 
 #include "discord_interactions/errors.hpp"
+#include "discord_interactions/json_access.hpp"
 #include "discord_interactions/limits.hpp"
 
 namespace discord_interactions {
 
 using json = nlohmann::json;
-
-namespace components_detail {
-
-// UTF-8-safe, no-ellipsis clamp for machine-facing values. Mirrors
-// autocomplete.hpp's clamp_value_no_ellipsis: a select-option value is an
-// identifier the client echoes back verbatim on selection, so an appended "…"
-// would corrupt it. Clamps to at most `max_bytes`, retreating to a UTF-8
-// codepoint boundary so a multibyte sequence is never split, appending nothing.
-inline std::string clamp_value_no_ellipsis(const std::string& text,
-                                           std::size_t max_bytes) {
-    if (text.size() <= max_bytes) {
-        return text;
-    }
-    std::size_t keep = max_bytes;
-    while (keep > 0 &&
-           (static_cast<unsigned char>(text[keep]) & 0xC0) == 0x80) {
-        --keep;
-    }
-    return text.substr(0, keep);
-}
-
-}  // namespace components_detail
 
 enum class ButtonStyle {
     primary = 1,
@@ -59,8 +40,8 @@ enum class ButtonStyle {
 
 // A button (component type 2). ButtonStyle::link emits `url` and no `custom_id`;
 // every other style emits `custom_id`, clamped to limits::custom_id via
-// safe_truncate. `disabled` and `emoji` are emitted only when non-default
-// (disabled == true, emoji non-null).
+// clamp_utf8 (machine-facing, so no ellipsis is ever injected). `disabled` and
+// `emoji` are emitted only when non-default (disabled == true, emoji non-null).
 inline json button(ButtonStyle style, const std::string& custom_id_or_url,
                    const std::string& label, bool disabled = false,
                    const json& emoji = json()) {
@@ -71,7 +52,7 @@ inline json button(ButtonStyle style, const std::string& custom_id_or_url,
     if (style == ButtonStyle::link) {
         result["url"] = custom_id_or_url;
     } else {
-        result["custom_id"] = safe_truncate(custom_id_or_url, limits::custom_id);
+        result["custom_id"] = clamp_utf8(custom_id_or_url, limits::custom_id);
     }
     if (disabled) {
         result["disabled"] = true;
@@ -93,8 +74,7 @@ inline json select_option(const std::string& label, const std::string& value,
                           bool is_default = false) {
     json result = json::object();
     result["label"] = safe_truncate(label, limits::select_option_field);
-    result["value"] =
-        components_detail::clamp_value_no_ellipsis(value, limits::select_option_field);
+    result["value"] = clamp_utf8(value, limits::select_option_field);
     if (!description.empty()) {
         result["description"] = safe_truncate(description, limits::select_option_field);
     }
@@ -107,8 +87,11 @@ inline json select_option(const std::string& label, const std::string& value,
 // A string select menu (component type 3). `placeholder`/`min_values`/
 // `max_values`/`disabled` are emitted only when non-default (min/max default 1).
 // Throws ModuleError(code="too_many_select_options", category=validation) when
-// `options` holds more than limits::select_options (25) entries, since Discord
-// rejects such payloads.
+// `options` holds more than limits::select_options (25) entries, and
+// ModuleError(code="invalid_select_values", category=validation) when the
+// documented min/max range is violated: min_values and max_values must each be
+// 0..limits::select_values_max (25), min_values <= max_values, and max_values
+// must not exceed the option count when `options` is non-empty.
 inline json string_select(const std::string& custom_id, const json& options,
                           const std::string& placeholder = "", int min_values = 1,
                           int max_values = 1, bool disabled = false) {
@@ -117,9 +100,21 @@ inline json string_select(const std::string& custom_id, const json& options,
                            "string select holds more than " +
                                std::to_string(limits::select_options) + " options");
     }
+    const int values_cap = static_cast<int>(limits::select_values_max);
+    if (min_values < 0 || min_values > values_cap || max_values < 0 ||
+        max_values > values_cap || min_values > max_values) {
+        throw MODULE_ERROR("invalid_select_values", ErrorCategory::validation,
+                           "string select min/max_values must satisfy 0 <= min <= max <= " +
+                               std::to_string(values_cap));
+    }
+    if (options.is_array() && !options.empty() &&
+        static_cast<std::size_t>(max_values) > options.size()) {
+        throw MODULE_ERROR("invalid_select_values", ErrorCategory::validation,
+                           "string select max_values exceeds the option count");
+    }
     json result = json::object();
     result["type"] = 3;
-    result["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    result["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     result["options"] = options;
     if (!placeholder.empty()) {
         result["placeholder"] = placeholder;
@@ -144,7 +139,7 @@ inline json entity_select(int type, const std::string& custom_id,
                           const std::string& placeholder) {
     json result = json::object();
     result["type"] = type;
-    result["custom_id"] = safe_truncate(custom_id, limits::custom_id);
+    result["custom_id"] = clamp_utf8(custom_id, limits::custom_id);
     if (!placeholder.empty()) {
         result["placeholder"] = placeholder;
     }
@@ -187,7 +182,9 @@ inline json action_row(const json& components) {
     std::size_t buttons = 0;
     std::size_t selects = 0;
     for (const auto& component : components) {
-        const int type = component.value("type", 0);
+        // Throw-free read (json_access.hpp): foreign component JSON with a
+        // wrong-typed "type" counts as neither a button nor a select.
+        const int type = get_if<int>(component, "type").value_or(0);
         if (type == 2) {
             ++buttons;
         } else if (type == 3 || type == 5 || type == 6 || type == 7 || type == 8) {

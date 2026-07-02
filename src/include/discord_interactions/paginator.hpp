@@ -17,8 +17,8 @@
 // non-numeric sentinel arg ("noop"), so Discord never delivers an interaction
 // for it. A component handler receiving the paginator prefix must therefore
 // ignore non-numeric args — `parse_page_after_prefix` deliberately keeps its
-// throw-on-nonnumeric contract (it does NOT special-case "noop"); the handler
-// filters, the parser stays strict.
+// throw-on-nonnumeric contract (it does NOT special-case "noop"), throwing
+// ModuleError(validation); the handler filters, the parser stays strict.
 //
 // Header-only, standard library plus nlohmann/json and the framework's
 // custom_id.hpp / components.hpp only (AD-2/AD-7). Consumed identically by unit
@@ -27,11 +27,11 @@
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
-#include <stdexcept>
 #include <string>
 
 #include "discord_interactions/components.hpp"
 #include "discord_interactions/custom_id.hpp"
+#include "discord_interactions/errors.hpp"
 
 namespace discord_interactions {
 
@@ -76,16 +76,34 @@ inline json paginator_row(const std::string& prefix, size_t page, size_t total_p
 }
 
 // Parses the destination page out of a paginator button's custom_id. Strict by
-// design: throws ModuleError(validation) on a wrong/empty prefix and rethrows
-// std::stoul's exception on a non-numeric arg (e.g. the counter's "noop"
-// sentinel). Callers must route only numeric-arg components.
+// design: throws ModuleError(code="paginator_unexpected_custom_id", validation)
+// on a wrong prefix or a missing arg, and
+// ModuleError(code="paginator_invalid_page", validation) unless the arg is a
+// non-empty, full-string run of ASCII digits that fits in size_t — "3abc",
+// "-1", "+1", "" and the counter's "noop" sentinel are all rejected. Callers
+// must route only numeric-arg components.
 inline size_t parse_page_after_prefix(const std::string& custom_id,
                                       const std::string& expected_prefix) {
     const CustomId parsed = parse_custom_id(custom_id);
     if (parsed.prefix != expected_prefix || parsed.args.empty()) {
-        throw std::runtime_error("Unexpected paginator custom_id");
+        throw MODULE_ERROR("paginator_unexpected_custom_id", ErrorCategory::validation,
+                           "unexpected paginator custom_id prefix or missing page arg");
     }
-    return static_cast<size_t>(std::stoul(parsed.args.front()));
+    const std::string& arg = parsed.args.front();
+    if (arg.empty() || arg.find_first_not_of("0123456789") != std::string::npos) {
+        throw MODULE_ERROR("paginator_invalid_page", ErrorCategory::validation,
+                           "paginator page arg must be digits only");
+    }
+    size_t page = 0;
+    for (const char ch : arg) {
+        const size_t digit = static_cast<size_t>(ch - '0');
+        if (page > (static_cast<size_t>(-1) - digit) / 10) {
+            throw MODULE_ERROR("paginator_invalid_page", ErrorCategory::validation,
+                               "paginator page arg overflows size_t");
+        }
+        page = page * 10 + digit;
+    }
+    return page;
 }
 
 }  // namespace discord_interactions

@@ -106,7 +106,8 @@ TEST_CASE("string_select shape with defaults omitted") {
 }
 
 TEST_CASE("string_select emits non-default placeholder/min/max/disabled") {
-    const json options = json::array({select_option("One", "1")});
+    const json options = json::array({select_option("One", "1"), select_option("Two", "2"),
+                                      select_option("Three", "3")});
     const json s = string_select("pick", options, "Choose", 0, 3, true);
     CHECK(s["placeholder"] == "Choose");
     CHECK(s["min_values"] == 0);
@@ -317,4 +318,103 @@ TEST_CASE("response.hpp link_button_row delegates to components.hpp") {
     const std::string body = header.substr(fn_pos);
     CHECK(body.find("button(") != std::string::npos);
     CHECK(body.find("action_row(") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// Throw-free JSON access + custom_id clamp integrity + select range validation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const std::string kEllipsisUtf8 = "\xE2\x80\xA6";
+
+bool is_well_formed_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len = 0;
+        if (c < 0x80) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else return false;
+        if (i + len > s.size()) return false;
+        for (size_t k = 1; k < len; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST_CASE("action_row tolerates a wrong-typed component type without throwing") {
+    // Untrusted/foreign component JSON whose "type" is a string; the row
+    // counter must not throw a nlohmann type_error.
+    const json comps = json::array({json{{"type", "2"}, {"custom_id", "x"}}});
+    CHECK_NOTHROW(action_row(comps));
+}
+
+TEST_CASE("button clamps a 101-byte custom_id to exactly 100 bytes with no ellipsis") {
+    const std::string long_id(101, 'x');
+    const json b = button(ButtonStyle::primary, long_id, "L");
+    const std::string clamped = b["custom_id"].get<std::string>();
+    CHECK(clamped.size() == 100u);
+    CHECK(clamped == std::string(100, 'x'));
+    CHECK(clamped.find(kEllipsisUtf8) == std::string::npos);
+    CHECK(is_well_formed_utf8(clamped));
+}
+
+TEST_CASE("select custom_ids clamp on a UTF-8 boundary without ellipsis") {
+    // 'a' + 50 two-byte 'é' = 101 bytes; byte 100 falls mid-'é', so the clamp
+    // must retreat to 99 bytes and never inject U+2026.
+    std::string long_id = "a";
+    for (int i = 0; i < 50; ++i) {
+        long_id += "\xC3\xA9";
+    }
+    REQUIRE(long_id.size() == 101u);
+    for (const json& s : {string_select(long_id, json::array()),
+                          user_select(long_id), role_select(long_id),
+                          channel_select(long_id)}) {
+        const std::string clamped = s["custom_id"].get<std::string>();
+        CHECK(clamped.size() == 99u);
+        CHECK(clamped.find(kEllipsisUtf8) == std::string::npos);
+        CHECK(is_well_formed_utf8(clamped));
+    }
+}
+
+TEST_CASE("string_select rejects min/max_values outside 0..25") {
+    const json options = json::array({select_option("One", "1")});
+    CHECK_THROWS_AS(string_select("pick", options, "", -1, 1), ModuleError);
+    CHECK_THROWS_AS(string_select("pick", options, "", 26, 1), ModuleError);
+    CHECK_THROWS_AS(string_select("pick", options, "", 0, -1), ModuleError);
+    CHECK_THROWS_AS(string_select("pick", options, "", 0, 26), ModuleError);
+}
+
+TEST_CASE("string_select rejects min_values greater than max_values") {
+    const json options = json::array(
+        {select_option("One", "1"), select_option("Two", "2")});
+    CHECK_THROWS_AS(string_select("pick", options, "", 2, 1), ModuleError);
+}
+
+TEST_CASE("string_select rejects max_values above the option count when options are non-empty") {
+    const json options = json::array({select_option("One", "1")});
+    try {
+        string_select("pick", options, "", 0, 2);
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.category == ErrorCategory::validation);
+    }
+    // With no options supplied yet the count check is skipped.
+    CHECK_NOTHROW(string_select("pick", json::array(), "", 0, 5));
+}
+
+TEST_CASE("string_select accepts boundary min/max ranges") {
+    json options = json::array();
+    for (int i = 0; i < 25; ++i) {
+        options.push_back(select_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    CHECK_NOTHROW(string_select("pick", options, "", 0, 25));
+    CHECK_NOTHROW(string_select("pick", options, "", 25, 25));
 }

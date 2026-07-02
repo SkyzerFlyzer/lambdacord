@@ -135,9 +135,37 @@ TEST_CASE("round-trip: parse_page_after_prefix on the next button id yields page
 TEST_CASE("the noop counter id is never routed: parse_page_after_prefix throws on it") {
     // The counter carries a non-numeric sentinel arg ("noop"). A component
     // handler receiving the paginator prefix must ignore non-numeric args; the
-    // throw here pins that parse_page_after_prefix keeps its throw-on-nonnumeric
-    // contract rather than silently returning a bogus page.
+    // ModuleError(validation) here pins that parse_page_after_prefix keeps its
+    // throw-on-nonnumeric contract rather than silently returning a bogus page.
     const json row = paginator_row("p", 2, 5);
     const std::string noop_id = button_at(row, 2)["custom_id"];
-    CHECK_THROWS(parse_page_after_prefix(noop_id, "p"));
+    try {
+        parse_page_after_prefix(noop_id, "p");
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.category == ErrorCategory::validation);
+    }
+}
+
+TEST_CASE("parse_page_after_prefix throws ModuleError(validation) on a wrong prefix") {
+    try {
+        parse_page_after_prefix("q:3", "p");
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.category == ErrorCategory::validation);
+    }
+    // A prefix with no arg at all is also a validation error.
+    CHECK_THROWS_AS(parse_page_after_prefix("p", "p"), ModuleError);
+}
+
+TEST_CASE("parse_page_after_prefix is strict full-string digits-only") {
+    // Trailing garbage must not parse as page 3 (std::stoul would accept it).
+    CHECK_THROWS_AS(parse_page_after_prefix("p:3abc", "p"), ModuleError);
+    // A sign is not a digit; "-1" must not wrap to a huge page.
+    CHECK_THROWS_AS(parse_page_after_prefix("p:-1", "p"), ModuleError);
+    CHECK_THROWS_AS(parse_page_after_prefix("p:+1", "p"), ModuleError);
+    // An empty arg is rejected too.
+    CHECK_THROWS_AS(parse_page_after_prefix("p:", "p"), ModuleError);
+    // Plain digits still parse.
+    CHECK(parse_page_after_prefix("p:12", "p") == 12);
 }

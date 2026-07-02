@@ -167,3 +167,50 @@ TEST_CASE("limits constants are constexpr size_t usable at compile time") {
                   "limits constants must be size_t");
     CHECK(true);
 }
+
+// ---------------------------------------------------------------------------
+// clamp_utf8: the machine-facing, no-ellipsis clamp (single source of truth
+// for custom_id and select/autocomplete value clamping).
+// ---------------------------------------------------------------------------
+
+using discord_interactions::clamp_utf8;
+
+TEST_CASE("clamp_utf8 passes through text at or under the limit") {
+    CHECK(clamp_utf8("hello", 100) == "hello");
+    CHECK(clamp_utf8("hello", 5) == "hello");
+    CHECK(clamp_utf8("", 0) == "");
+}
+
+TEST_CASE("clamp_utf8 cuts a 101-byte string to exactly 100 bytes with no ellipsis") {
+    const std::string text(101, 'x');
+    const std::string out = clamp_utf8(text, 100);
+    CHECK(out.size() == 100u);
+    CHECK(out == std::string(100, 'x'));
+    CHECK(out.find(kEllipsis) == std::string::npos);
+    CHECK(is_valid_utf8(out));
+}
+
+TEST_CASE("clamp_utf8 retreats to a UTF-8 codepoint boundary") {
+    const std::string emoji = "\xF0\x9F\x98\x80";  // U+1F600, 4 bytes
+    const std::string text = emoji + emoji + emoji;  // 12 bytes
+    // Budget 10 lands mid-emoji; the clamp retreats to 8 bytes (two emoji)
+    // and appends nothing.
+    const std::string out = clamp_utf8(text, 10);
+    CHECK(out == emoji + emoji);
+    CHECK(out.size() == 8u);
+    CHECK(out.find(kEllipsis) == std::string::npos);
+    CHECK(is_valid_utf8(out));
+}
+
+TEST_CASE("clamp_utf8 with a tiny budget never emits an ellipsis") {
+    CHECK(clamp_utf8("abcdef", 2) == "ab");
+    CHECK(clamp_utf8("abcdef", 0) == "");
+    // A budget cutting into a lone multibyte char retreats to empty.
+    CHECK(clamp_utf8("\xF0\x9F\x98\x80", 2) == "");
+}
+
+TEST_CASE("checkbox group and select value-range limits match the documented values") {
+    CHECK(limits::checkbox_group_options_min == 1);
+    CHECK(limits::checkbox_group_options_max == 10);
+    CHECK(limits::select_values_max == 25);
+}

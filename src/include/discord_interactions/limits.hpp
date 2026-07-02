@@ -57,7 +57,12 @@ inline constexpr std::size_t label_description = 100;
 // Radio Group / Checkbox Group option and value bounds.
 inline constexpr std::size_t radio_options_min = 2;
 inline constexpr std::size_t radio_options_max = 10;
+inline constexpr std::size_t checkbox_group_options_min = 1;
+inline constexpr std::size_t checkbox_group_options_max = 10;
 inline constexpr std::size_t checkbox_group_max_values = 10;
+
+// String select min_values/max_values bound (each 0..25).
+inline constexpr std::size_t select_values_max = 25;
 
 // Button label and select-option field caps.
 inline constexpr std::size_t button_label = 80;
@@ -102,6 +107,29 @@ inline std::string safe_truncate(const std::string& text, std::size_t max_bytes)
     result.append(text, 0, keep);
     result.append(ellipsis);
     return result;
+}
+
+// UTF-8-safe, no-ellipsis clamp for MACHINE-FACING strings — the single source
+// of truth for clamping custom_ids and select/autocomplete choice values.
+//
+// Distinct from safe_truncate, which appends an ellipsis: a custom_id or a
+// choice/option value is an identifier the client round-trips verbatim, so an
+// appended "…" would corrupt it (an oversized paginator id "list:…:12" would
+// re-parse as page 1). This clamps to at most `max_bytes`, retreating to a
+// UTF-8 codepoint boundary so a multibyte sequence is never split, and appends
+// nothing.
+inline std::string clamp_utf8(const std::string& text, std::size_t max_bytes) {
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+    std::size_t keep = max_bytes;
+    // Continuation bytes match 10xxxxxx (0x80..0xBF); retreat off any partial
+    // multibyte sequence so the cut lands on a codepoint boundary.
+    while (keep > 0 &&
+           (static_cast<unsigned char>(text[keep]) & 0xC0) == 0x80) {
+        --keep;
+    }
+    return text.substr(0, keep);
 }
 
 }  // namespace discord_interactions

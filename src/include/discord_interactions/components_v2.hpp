@@ -39,7 +39,13 @@ using json = nlohmann::json;
 inline constexpr int message_flag_components_v2 = 1 << 15;
 
 // A text display block (component type 10). Content is clamped through
-// safe_truncate to limits::text_display_content.
+// safe_truncate to limits::text_display_content (4000).
+//
+// NOTE: this 4000-character clamp is PER-COMPONENT and deliberately
+// conservative. Discord's combined-per-message text budget across all text
+// displays is not currently documented in the component reference, so it is
+// deliberately NOT enforced here — very text-heavy multi-display messages may
+// still be rejected by Discord's API.
 inline json text_display(const std::string& content) {
     json result = json::object();
     result["type"] = 10;

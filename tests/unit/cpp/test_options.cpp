@@ -218,3 +218,52 @@ TEST_CASE("resolved lookups on interaction with no data return empty") {
     CHECK(di::resolved_role(it, "1").empty());
     CHECK(di::resolved_attachment(it, "1").empty());
 }
+
+// ---------------------------------------------------------------------------
+// Throw-free access on wrong-typed untrusted JSON (FIX: json_access contract)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("command_options tolerates a wrong-typed option type without throwing") {
+    // "type" is the string "1", not the integer 1: the walker must treat it as
+    // a plain (non-subcommand) option list instead of throwing.
+    const json interaction = json{
+        {"type", 2},
+        {"data",
+         {{"name", "config"},
+          {"options",
+           json::array({json{{"name", "text"}, {"type", "1"}, {"value", "hello"}}})}}}};
+    json options{};
+    CHECK_NOTHROW(options = di::command_options(interaction));
+    REQUIRE(options.is_array());
+    CHECK(options.size() == 1);
+    CHECK(di::option_string(interaction, "text").value_or("") == "hello");
+}
+
+TEST_CASE("option lookups skip a numeric option name without throwing") {
+    const json interaction = json{
+        {"type", 2},
+        {"data",
+         {{"name", "config"},
+          {"options",
+           json::array({json{{"name", 42}, {"type", 3}, {"value", "bogus"}},
+                        json{{"name", "real"}, {"type", 3}, {"value", "ok"}}})}}}};
+    std::optional<std::string> value{};
+    CHECK_NOTHROW(value = di::option_string(interaction, "real"));
+    REQUIRE(value.has_value());
+    CHECK(value.value() == "ok");
+    CHECK_NOTHROW(di::option_string(interaction, "42"));
+    CHECK_FALSE(di::option_string(interaction, "42").has_value());
+}
+
+TEST_CASE("option_id returns nullopt on a wrong-typed option type without throwing") {
+    // "type" is the string "6" — not an integer snowflake type code.
+    const json interaction = json{
+        {"type", 2},
+        {"data",
+         {{"name", "config"},
+          {"options",
+           json::array({json{{"name", "who"}, {"type", "6"}, {"value", "123"}}})}}}};
+    std::optional<std::string> id{};
+    CHECK_NOTHROW(id = di::option_id(interaction, "who"));
+    CHECK_FALSE(id.has_value());
+}

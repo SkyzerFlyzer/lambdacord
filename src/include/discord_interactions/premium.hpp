@@ -32,10 +32,12 @@ inline json entitlements(const json& interaction) {
 }
 
 // True when the interaction carries an entitlement that matches sku_id, is not
-// "deleted": true, and either has an absent/null "ends_at" or an "ends_at" that
-// is lexicographically greater than now_iso8601 (ISO-8601 UTC strings compare
+// "deleted": true, and — when now_iso8601 is supplied — is currently active:
+// an absent/null "starts_at" or a "starts_at" lexicographically <= now_iso8601
+// (not yet started otherwise), and an absent/null "ends_at" or an "ends_at"
+// lexicographically greater than now_iso8601 (ISO-8601 UTC strings compare
 // correctly byte-for-byte when zero-padded to the same shape). An empty
-// now_iso8601 (the default) skips the expiry check entirely.
+// now_iso8601 (the default) skips both time checks entirely.
 inline bool has_entitlement_for_sku(const json& interaction, const std::string& sku_id,
                                     const std::string& now_iso8601 = "") {
     const json ents = entitlements(interaction);
@@ -57,6 +59,13 @@ inline bool has_entitlement_for_sku(const json& interaction, const std::string& 
         }
 
         if (!now_iso8601.empty()) {
+            const auto starts_it = entitlement.find("starts_at");
+            if (starts_it != entitlement.end() && starts_it->is_string()) {
+                const std::string starts_at = starts_it->get<std::string>();
+                if (starts_at > now_iso8601) {
+                    continue;  // not started yet
+                }
+            }
             const auto ends_it = entitlement.find("ends_at");
             if (ends_it != entitlement.end() && ends_it->is_string()) {
                 const std::string ends_at = ends_it->get<std::string>();

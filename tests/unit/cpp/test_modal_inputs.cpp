@@ -163,9 +163,64 @@ TEST_CASE("checkbox_group rejects max_values above limits::checkbox_group_max_va
         ModuleError);
 }
 
-TEST_CASE("checkbox_group accepts a boundary 0..10 range") {
+TEST_CASE("checkbox_group accepts a boundary 0..10 range when not required") {
+    // min_values: 0 is only legal on a non-required group; a required group
+    // must have min_values omitted or >= 1 (Discord's documented constraint).
     CHECK_NOTHROW(
-        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 0, 10));
+        checkbox_group("pick", json::array({radio_option("a", "a")}), false, 0, 10));
+    CHECK_NOTHROW(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 1, 10));
+}
+
+TEST_CASE("checkbox_group rejects min_values 0 when required") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, 0, 10),
+        ModuleError);
+    // required with min_values omitted stays legal.
+    CHECK_NOTHROW(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), true, -1, 10));
+}
+
+TEST_CASE("checkbox_group rejects a set max_values below 1") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(
+        checkbox_group("pick", json::array({radio_option("a", "a")}), false, -1, 0),
+        ModuleError);
+}
+
+TEST_CASE("checkbox_group rejects non-array, empty, and oversized option lists") {
+    using discord_interactions::ModuleError;
+    CHECK_THROWS_AS(checkbox_group("pick", json::object()), ModuleError);
+    CHECK_THROWS_AS(checkbox_group("pick", json("nope")), ModuleError);
+    CHECK_THROWS_AS(checkbox_group("pick", json::array()), ModuleError);
+    json eleven = json::array();
+    for (int i = 0; i < 11; ++i) {
+        eleven.push_back(radio_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    CHECK_THROWS_AS(checkbox_group("pick", eleven), ModuleError);
+}
+
+TEST_CASE("checkbox_group accepts 1 and 10 options") {
+    CHECK_NOTHROW(checkbox_group("pick", json::array({radio_option("a", "a")})));
+    json ten = json::array();
+    for (int i = 0; i < 10; ++i) {
+        ten.push_back(radio_option("L" + std::to_string(i), std::to_string(i)));
+    }
+    CHECK_NOTHROW(checkbox_group("pick", ten));
+}
+
+TEST_CASE("modal input custom_ids clamp to 100 bytes without an ellipsis") {
+    const std::string long_id(101, 'k');
+    const std::string expected(100, 'k');
+    const json opts = json::array({radio_option("a", "a"), radio_option("b", "b")});
+    for (const json& input : {file_upload(long_id), radio_group(long_id, opts),
+                              checkbox_group(long_id, opts), checkbox(long_id)}) {
+        const std::string clamped = input["custom_id"].get<std::string>();
+        CHECK(clamped.size() == 100u);
+        CHECK(clamped == expected);
+        CHECK(clamped.find("\xE2\x80\xA6") == std::string::npos);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +268,9 @@ TEST_CASE("modal_values extracts checkbox-group selections through a Label wrapp
     CHECK(values[1] == "sms");
 }
 
-TEST_CASE("modal_values extracts file-upload attachment ids") {
+TEST_CASE("modal_values extracts file-upload values") {
+    // Discord delivers a submitted File Upload's attachment snowflakes under
+    // "values" — the same key a Checkbox Group uses.
     const json interaction = json{
         {"type", 5},
         {"data", {
@@ -221,7 +278,7 @@ TEST_CASE("modal_values extracts file-upload attachment ids") {
             {"components", json::array({
                 json{{"type", 18}, {"component", {
                     {"type", 19}, {"custom_id", "resume"},
-                    {"attachment_ids", json::array({"1234567890", "9876543210"})}}}},
+                    {"values", json::array({"1234567890", "9876543210"})}}}},
             })},
         }},
     };
@@ -229,6 +286,23 @@ TEST_CASE("modal_values extracts file-upload attachment ids") {
     REQUIRE(ids.size() == 2);
     CHECK(ids[0] == "1234567890");
     CHECK(ids[1] == "9876543210");
+}
+
+TEST_CASE("modal_values ignores the undocumented attachment_ids key") {
+    // "attachment_ids" does not exist in Discord's documented MODAL_SUBMIT
+    // shape (file uploads submit "values"); the extractor must not read it.
+    const json interaction = json{
+        {"type", 5},
+        {"data", {
+            {"custom_id", "upload_modal"},
+            {"components", json::array({
+                json{{"type", 18}, {"component", {
+                    {"type", 19}, {"custom_id", "resume"},
+                    {"attachment_ids", json::array({"1234567890"})}}}},
+            })},
+        }},
+    };
+    CHECK(modal_values(interaction, "resume").empty());
 }
 
 TEST_CASE("modal_values returns an empty vector for an absent custom_id") {
@@ -313,7 +387,7 @@ TEST_CASE("extraction works over a real-shaped multi-input MODAL_SUBMIT fixture"
                     {"type", 4}, {"custom_id", "name"}, {"value", "Ada"}}}},
                 json{{"type", 18}, {"label", "Avatar"}, {"component", {
                     {"type", 19}, {"custom_id", "avatar"},
-                    {"attachment_ids", json::array({"555"})}}}},
+                    {"values", json::array({"555"})}}}},
                 json{{"type", 18}, {"label", "Channels"}, {"component", {
                     {"type", 22}, {"custom_id", "channels"},
                     {"values", json::array({"general", "random"})}}}},

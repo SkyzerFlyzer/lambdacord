@@ -214,3 +214,39 @@ TEST_CASE("no focused option yields nullopt for both getters") {
     CHECK_FALSE(di::focused_option_name(json{{"type", 4}}).has_value());
     CHECK_FALSE(di::focused_option_value(json{{"type", 4}}).has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Throw-free focused walker on wrong-typed untrusted JSON
+// ---------------------------------------------------------------------------
+
+TEST_CASE("focused walker skips an integer focused flag without throwing") {
+    // "focused" is the integer 1, not a boolean: the walker must skip it
+    // instead of throwing a nlohmann type_error.
+    const json interaction = json{
+        {"type", 4},
+        {"data",
+         {{"name", "search"},
+          {"options",
+           json::array({json{{"name", "term"}, {"type", 3}, {"focused", 1}}})}}}};
+    std::optional<std::string> name{};
+    CHECK_NOTHROW(name = di::focused_option_name(interaction));
+    CHECK_FALSE(name.has_value());
+    CHECK_NOTHROW(di::focused_option_value(interaction));
+}
+
+TEST_CASE("focused walker tolerates a string type code and still finds the focused option") {
+    const json interaction = json{
+        {"type", 4},
+        {"data",
+         {{"name", "search"},
+          {"options",
+           json::array({json{{"name", "grp"}, {"type", "1"},
+                             {"options", json::array()}},
+                        json{{"name", "term"}, {"type", 3}, {"value", "pa"},
+                             {"focused", true}}})}}}};
+    std::optional<std::string> name{};
+    CHECK_NOTHROW(name = di::focused_option_name(interaction));
+    REQUIRE(name.has_value());
+    CHECK(name.value() == "term");
+    CHECK(di::focused_option_value(interaction).value_or("") == "pa");
+}

@@ -271,3 +271,58 @@ TEST_CASE("modal_value extracts from a real-shaped multi-input MODAL_SUBMIT") {
     CHECK(modal_value(interaction, "details").value() == "It broke");
     CHECK_FALSE(modal_value(interaction, "nope").has_value());
 }
+
+// ---------------------------------------------------------------------------
+// custom_id clamp integrity + text_input length-range validation
+// ---------------------------------------------------------------------------
+
+TEST_CASE("text_input clamps a 101-byte custom_id to exactly 100 bytes with no ellipsis") {
+    const std::string long_id(101, 'x');
+    const json input = text_input(long_id, TextInputStyle::short_input);
+    const std::string clamped = input["custom_id"].get<std::string>();
+    CHECK(clamped.size() == 100u);
+    CHECK(clamped == std::string(100, 'x'));
+    CHECK(clamped.find("\xE2\x80\xA6") == std::string::npos);
+}
+
+TEST_CASE("modal clamps its own custom_id without an ellipsis") {
+    const std::string long_id(101, 'm');
+    const json response = modal(long_id, "Title", {
+        label_component("Q", text_input("q", TextInputStyle::short_input)),
+    });
+    const std::string clamped = response["data"]["custom_id"].get<std::string>();
+    CHECK(clamped.size() == 100u);
+    CHECK(clamped == std::string(100, 'm'));
+    CHECK(clamped.find("\xE2\x80\xA6") == std::string::npos);
+}
+
+TEST_CASE("text_input rejects out-of-range min_length") {
+    CHECK_THROWS_AS(text_input("f", TextInputStyle::short_input, true, "", "", -1, 0),
+                    ModuleError);
+    CHECK_THROWS_AS(text_input("f", TextInputStyle::short_input, true, "", "", 4001, 0),
+                    ModuleError);
+}
+
+TEST_CASE("text_input rejects out-of-range max_length") {
+    // max_length == 0 means "omit"; a set max_length must be 1..4000.
+    CHECK_THROWS_AS(text_input("f", TextInputStyle::short_input, true, "", "", 0, -1),
+                    ModuleError);
+    CHECK_THROWS_AS(text_input("f", TextInputStyle::short_input, true, "", "", 0, 4001),
+                    ModuleError);
+}
+
+TEST_CASE("text_input rejects min_length greater than max_length when both set") {
+    try {
+        text_input("f", TextInputStyle::short_input, true, "", "", 5, 3);
+        FAIL("expected ModuleError");
+    } catch (const ModuleError& e) {
+        CHECK(e.category == discord_interactions::ErrorCategory::validation);
+    }
+}
+
+TEST_CASE("text_input accepts boundary length ranges") {
+    CHECK_NOTHROW(text_input("f", TextInputStyle::short_input, true, "", "", 0, 0));
+    CHECK_NOTHROW(text_input("f", TextInputStyle::short_input, true, "", "", 0, 4000));
+    CHECK_NOTHROW(text_input("f", TextInputStyle::short_input, true, "", "", 4000, 4000));
+    CHECK_NOTHROW(text_input("f", TextInputStyle::short_input, true, "", "", 1, 1));
+}

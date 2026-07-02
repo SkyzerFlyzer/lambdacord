@@ -102,6 +102,32 @@ TEST_CASE("has_entitlement_for_sku future ends_at passes when now supplied") {
     CHECK(has_entitlement_for_sku(interaction, "sku_1", "2026-07-02T00:00:00.000000+00:00"));
 }
 
+TEST_CASE("has_entitlement_for_sku future starts_at fails when now supplied") {
+    const json interaction = interaction_with(
+        json::array({{{"sku_id", "sku_1"}, {"starts_at", "2099-01-01T00:00:00.000000+00:00"}}}));
+    CHECK_FALSE(has_entitlement_for_sku(interaction, "sku_1", "2026-07-02T00:00:00.000000+00:00"));
+}
+
+TEST_CASE("has_entitlement_for_sku past starts_at passes when now supplied") {
+    const json interaction = interaction_with(
+        json::array({{{"sku_id", "sku_1"}, {"starts_at", "2020-01-01T00:00:00.000000+00:00"}}}));
+    CHECK(has_entitlement_for_sku(interaction, "sku_1", "2026-07-02T00:00:00.000000+00:00"));
+}
+
+TEST_CASE("has_entitlement_for_sku starts_at null or absent passes when now supplied") {
+    const json with_null = interaction_with(
+        json::array({{{"sku_id", "sku_1"}, {"starts_at", nullptr}}}));
+    CHECK(has_entitlement_for_sku(with_null, "sku_1", "2026-07-02T00:00:00.000000+00:00"));
+    const json absent = interaction_with(json::array({{{"sku_id", "sku_1"}}}));
+    CHECK(has_entitlement_for_sku(absent, "sku_1", "2026-07-02T00:00:00.000000+00:00"));
+}
+
+TEST_CASE("has_entitlement_for_sku starts_at check skipped when now empty") {
+    const json interaction = interaction_with(
+        json::array({{{"sku_id", "sku_1"}, {"starts_at", "2099-01-01T00:00:00.000000+00:00"}}}));
+    CHECK(has_entitlement_for_sku(interaction, "sku_1"));
+}
+
 TEST_CASE("has_entitlement_for_sku expiry skipped when now empty") {
     const json interaction = interaction_with(
         json::array({{{"sku_id", "sku_1"}, {"ends_at", "2020-01-01T00:00:00.000000+00:00"}}}));

@@ -13,7 +13,8 @@
 // out of the interaction — walking nested subcommand/group option lists.
 //
 // Header-only (AD-2), namespace discord_interactions. Depends only on
-// nlohmann/json and limits.hpp — no AWS SDK, libsodium, or curl.
+// nlohmann/json, limits.hpp, and json_access.hpp — no AWS SDK, libsodium, or
+// curl.
 
 #include <nlohmann/json.hpp>
 
@@ -22,6 +23,7 @@
 #include <optional>
 #include <string>
 
+#include "discord_interactions/json_access.hpp"
 #include "discord_interactions/limits.hpp"
 
 namespace discord_interactions {
@@ -32,28 +34,6 @@ using json = nlohmann::json;
 namespace autocomplete_detail {
 inline constexpr int sub_command = 1;
 inline constexpr int sub_command_group = 2;
-
-// UTF-8-safe, no-ellipsis clamp for machine-facing choice values.
-//
-// Distinct from limits.hpp's safe_truncate, which appends an ellipsis: a string
-// choice value is an identifier the client sends back verbatim on selection, so
-// an appended "…" would corrupt it. This clamps to at most `max_bytes`,
-// retreating to a UTF-8 codepoint boundary so a multibyte sequence is never
-// split, and appends nothing.
-inline std::string clamp_value_no_ellipsis(const std::string& text,
-                                           std::size_t max_bytes) {
-    if (text.size() <= max_bytes) {
-        return text;
-    }
-    std::size_t keep = max_bytes;
-    // Continuation bytes match 10xxxxxx (0x80..0xBF); retreat off any partial
-    // multibyte sequence so the cut lands on a codepoint boundary.
-    while (keep > 0 &&
-           (static_cast<unsigned char>(text[keep]) & 0xC0) == 0x80) {
-        --keep;
-    }
-    return text.substr(0, keep);
-}
 
 // ASCII-lowercase copy for case-insensitive comparison. Autocomplete queries
 // are short user input; a byte-wise lowercase is sufficient for the common
@@ -75,6 +55,9 @@ inline std::string to_lower_ascii(const std::string& s) {
 // Recursively search an option array for the option carrying "focused": true,
 // descending through subcommand (1) and subcommand group (2) option lists.
 // Returns a pointer to the focused option object, or nullptr when none is found.
+// All field reads go through get_if (json_access.hpp) so a wrong-typed
+// "focused" (e.g. the integer 1) or "type" (e.g. the string "1") is skipped
+// instead of throwing — this walker is genuinely non-throwing on untrusted JSON.
 inline const json* find_focused(const json& options) {
     if (!options.is_array()) {
         return nullptr;
@@ -83,10 +66,10 @@ inline const json* find_focused(const json& options) {
         if (!option.is_object()) {
             continue;
         }
-        if (option.value("focused", false)) {
+        if (get_if<bool>(option, "focused").value_or(false)) {
             return &option;
         }
-        const int type = option.value("type", 0);
+        const int type = get_if<int>(option, "type").value_or(0);
         if (type == sub_command || type == sub_command_group) {
             if (option.contains("options")) {
                 const json* nested = find_focused(option.at("options"));
@@ -134,7 +117,7 @@ inline json choice(const std::string& name, double value) {
 // limits::choice_name (100) via safe_truncate, and clamps each string choice
 // VALUE to Discord's 100-byte value limit. String values are machine-facing
 // identifiers echoed back verbatim on selection, so they are clamped WITHOUT an
-// ellipsis (see clamp_value_no_ellipsis) — an appended "…" would corrupt the
+// ellipsis (via limits.hpp's clamp_utf8) — an appended "…" would corrupt the
 // identifier. The 100-byte value cap equals limits::choice_name. Non-string
 // (int/double) values are left untouched. Returns {type:8, data:{choices:[...]}}.
 inline json autocomplete_response(const json& choices) {
@@ -152,8 +135,8 @@ inline json autocomplete_response(const json& choices) {
             }
             if (entry.is_object() && entry.contains("value") &&
                 entry.at("value").is_string()) {
-                entry["value"] = autocomplete_detail::clamp_value_no_ellipsis(
-                    entry.at("value").get<std::string>(), limits::choice_name);
+                entry["value"] = clamp_utf8(entry.at("value").get<std::string>(),
+                                            limits::choice_name);
             }
             out.push_back(std::move(entry));
         }

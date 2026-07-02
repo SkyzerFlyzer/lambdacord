@@ -18,6 +18,8 @@
 #include <optional>
 #include <string>
 
+#include "discord_interactions/json_access.hpp"
+
 namespace discord_interactions {
 
 using json = nlohmann::json;
@@ -55,8 +57,10 @@ inline json command_options(const json& interaction) {
     }
 
     // Descend while the first option is a subcommand or subcommand group.
+    // get_if keeps this throw-free when "type" is present but wrong-typed
+    // (e.g. the string "1"): the mismatch reads as 0 = not a subcommand.
     while (!options.empty() && options.at(0).is_object()) {
-        const int type = options.at(0).value("type", 0);
+        const int type = get_if<int>(options.at(0), "type").value_or(0);
         if (type != option_type::sub_command && type != option_type::sub_command_group) {
             break;
         }
@@ -78,7 +82,10 @@ namespace detail {
 inline json find_option(const json& interaction, const std::string& name) {
     const json options = command_options(interaction);
     for (const auto& option : options) {
-        if (option.is_object() && option.value("name", "") == name) {
+        // get_if never throws on a wrong-typed "name" (e.g. a number): such an
+        // option simply never matches.
+        const std::optional<std::string> option_name = get_if<std::string>(option, "name");
+        if (option_name.has_value() && option_name.value() == name) {
             return option;
         }
     }
@@ -159,7 +166,9 @@ inline std::optional<bool> option_bool(const json& interaction,
 inline std::optional<std::string> option_id(const json& interaction,
                                             const std::string& name) {
     const json option = detail::find_option(interaction, name);
-    const int type = option.value("type", 0);
+    // Throw-free read: a wrong-typed "type" (e.g. the string "6") reads as 0,
+    // which is not a snowflake type, so the lookup yields nullopt.
+    const int type = get_if<int>(option, "type").value_or(0);
     const bool is_snowflake_type =
         type == option_type::user || type == option_type::channel ||
         type == option_type::role || type == option_type::mentionable ||
