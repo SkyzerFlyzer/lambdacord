@@ -44,6 +44,7 @@ These are the scripts normal project users should reach for:
 | `scripts/test-local-discord-lambdas.sh` | Run the local Discord Lambda integration suites against built zip artifacts. |
 | `scripts/generate-terraform-modules.py` | Regenerate root Terraform module wiring from installed module manifests. |
 | `scripts/terraform-deploy.sh <action>` | Regenerate module Terraform wiring, optionally build Lambdas, then run Terraform `init`, `validate`, `plan`, `apply`, or `output`. |
+| `scripts/new-lambda.py --module <name> --kind command\|component\|modal\|autocomplete --path "..."` | Scaffold a correctly named module Lambda skeleton (AGENTS.md-compliant `main.cpp`), wire its manifest route, and append a schema stub for command kinds. Autocomplete also takes `--option`; `--dry-run` previews without writing. |
 | `scripts/register-discord-commands.py` | Merge installed module command schemas and bulk overwrite Discord application commands. |
 | `scripts/register-discord-commands.py --validate-only` | Validate installed module manifests, routes, command schemas, error schemas, Lambda folders, and Terraform folders without calling Discord. |
 | `scripts/remove-discord-commands.py` | Clear registered Discord commands for a guild or globally. |
@@ -173,6 +174,37 @@ arbitrary module sources by scanning the filesystem. This repo handles that by
 generating root Terraform wiring from installed module manifests into
 `infra/terraform/generated_*.tf`; run `scripts/generate-terraform-modules.py`
 directly, or use `scripts/terraform-deploy.sh`, which runs it for you.
+
+## Scaffolding A New Lambda
+
+`scripts/new-lambda.py` generates a correctly named Lambda skeleton inside a
+module, wires its `module.manifest.json` route, appends a schema stub for
+command kinds, and prints a next-step checklist. The generated `main.cpp`
+already follows the framework rules (value-init with `{}`, `application_id`/
+`token` via `discord_interactions::metadata`, deferred PATCH via
+`patch_original_response` on success and safe-error paths, `MODULE_ERROR` for
+expected failures, internals logged to stderr only). Autocomplete instead
+returns the synchronous `{type:8}` choice payload via `autocomplete_response`.
+
+```bash
+# Slash command (path is "group sub" / "group subgroup sub")
+python3 scripts/new-lambda.py --module <name> --kind command --path "account link"
+
+# Message component / modal (path is the custom_id prefix, a single token)
+python3 scripts/new-lambda.py --module <name> --kind component --path vote
+python3 scripts/new-lambda.py --module <name> --kind modal --path feedback
+
+# Autocomplete (requires --option)
+python3 scripts/new-lambda.py --module <name> --kind autocomplete \
+    --path weather --option city
+
+# Preview without writing anything
+python3 scripts/new-lambda.py --module <name> --kind command --path "account link" --dry-run
+```
+
+The generator refuses (non-zero exit) if the route already exists. After
+scaffolding, implement the `TODO`, build with `scripts/build-lambda.sh`, and
+register with `scripts/register-discord-commands.py`.
 
 ## Discord Command Registration
 
