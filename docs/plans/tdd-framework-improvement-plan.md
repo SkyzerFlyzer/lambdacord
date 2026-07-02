@@ -146,6 +146,10 @@ Subagents must treat these as settled; do not re-litigate them mid-task.
   stateless and mechanical — it only parses the env var; it never reads manifests at
   runtime. Declaration lives with the command that owns it, so there is no
   config-drift failure mode. (T3.2 specifies details.)
+  - *Review follow-up:* the opt-in also applies to context menu commands —
+    `ephemeral_defer` is legal on `user_commands` / `message_commands` routes
+    (keyed by the raw command name the ingress matches), not just slash-command
+    routes.
 - **AD-6: Python tooling changes must go through `scripts/lib/discord_modules.py`**, not
   duplicated parsing in entry-point scripts.
 - **AD-7: No new third-party runtime dependencies** beyond what the builder image
@@ -749,6 +753,9 @@ Task ID format: `T<phase>.<n>`.
     `ephemeral_defer: false`; `routing.hpp`'s `route_from_manifest_entry` and all
     Python route parsing must accept both forms. Validation rejects
     `ephemeral_defer` on non-command route kinds and non-boolean values.
+    *(Review follow-up: `ephemeral_defer` is also permitted on the context-menu
+    route kinds `user_commands` / `message_commands` — keyed by the raw command
+    name; it remains rejected on `components`, `modals`, and `autocomplete`.)*
   - **Generator:** `scripts/generate-terraform-modules.py` collects all command paths
     with `ephemeral_defer: true` across installed modules (sorted, deduplicated) and
     emits them as a comma-separated string into the ingress Lambda's

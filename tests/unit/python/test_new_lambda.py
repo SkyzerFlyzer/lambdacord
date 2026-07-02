@@ -306,6 +306,27 @@ class TestCommandTemplate:
             if "what()" in line:
                 assert "stderr" in line, f"what() leaked outside logging: {line!r}"
 
+    def _module_error_block(self, repo_root, make_module):
+        text = self._generate(repo_root, make_module)
+        after = text.split("catch (const discord_interactions::ModuleError")[1]
+        return after.split("catch (const std::exception")[0]
+
+    def test_mapped_error_returns_success_when_patch_succeeds(self, repo_root, make_module):
+        # Finding 5: a mapped ModuleError whose friendly PATCH landed is fully
+        # handled. Returning success stops AWS async retry from re-running an
+        # already-user-visible interaction (duplicate error messages / AD-9).
+        text = self._generate(repo_root, make_module)
+        assert "bool patch_friendly_error" in text
+        block = self._module_error_block(repo_root, make_module)
+        assert "if (patch_friendly_error(application_id, token))" in block
+        assert "invocation_response::success" in block
+
+    def test_mapped_error_still_fails_when_patch_fails(self, repo_root, make_module):
+        # When the friendly PATCH never reached Discord, still fail so the retry
+        # can attempt to deliver a response.
+        block = self._module_error_block(repo_root, make_module)
+        assert "invocation_response::failure" in block
+
 
 # ---------------------------------------------------------------------------
 # Template content — autocomplete kind (sync {type:8} choices)

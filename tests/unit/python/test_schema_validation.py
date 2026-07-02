@@ -254,6 +254,54 @@ class TestOptionCount:
 
 
 # ---------------------------------------------------------------------------
+# Option type must be a supported integer (Finding 3)
+# ---------------------------------------------------------------------------
+
+
+class TestOptionType:
+    def test_accepts_all_valid_option_types(self):
+        # Discord option types 1..11 are all valid leaves/containers.
+        for otype in range(1, 12):
+            msg = problems_for(
+                [
+                    {
+                        "name": "cmd",
+                        "description": "d",
+                        "options": [{"type": otype, "name": "opt", "description": "d"}],
+                    }
+                ]
+            )
+            assert "missing a type" not in msg and "unsupported type" not in msg, (
+                otype,
+                msg,
+            )
+
+    def test_rejects_unsupported_option_type(self):
+        msg = problems_for(
+            [
+                {
+                    "name": "cmd",
+                    "description": "d",
+                    "options": [{"type": 99, "name": "opt", "description": "d"}],
+                }
+            ]
+        )
+        assert "unsupported type" in msg
+
+    def test_rejects_missing_option_type(self):
+        msg = problems_for(
+            [
+                {
+                    "name": "cmd",
+                    "description": "d",
+                    "options": [{"name": "opt", "description": "d"}],
+                }
+            ]
+        )
+        assert "missing a type" in msg
+
+
+# ---------------------------------------------------------------------------
 # Choices: count, name length, string value length
 # ---------------------------------------------------------------------------
 

@@ -129,9 +129,12 @@ A manifest command route value may take either form:
 ```
 
 The plain-string form means `ephemeral_defer: false`. The object form requires a
-non-empty string `"lambda"`; `"ephemeral_defer"` must be a boolean and is only
-legal on `commands` routes — validation rejects it on every other route kind.
-Both `discord_interactions::route_from_manifest_entry` (`routing.hpp`) and the
+non-empty string `"lambda"`; `"ephemeral_defer"` must be a boolean and is legal
+on `commands`, `user_commands`, and `message_commands` routes — validation
+rejects it on every other route kind (components, modals, autocomplete). Slash
+commands opt in by their full command path; context menu commands opt in by
+their raw command name (the key the ingress matches a type-2/3 interaction
+against). Both `discord_interactions::route_from_manifest_entry` (`routing.hpp`) and the
 Python route parsing (`scripts/lib/discord_modules.py`) accept both forms.
 
 `scripts/generate-terraform-modules.py` merges the opted-in command paths across

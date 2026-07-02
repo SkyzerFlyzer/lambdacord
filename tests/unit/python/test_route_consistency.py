@@ -251,6 +251,32 @@ class TestAutocomplete:
             for m in result["errors"]
         )
 
+    def test_autocomplete_route_present_but_folder_missing_is_error(
+        self, repo_root, make_module
+    ):
+        # Finding 4: the derived autocomplete Lambda name is a route target, but
+        # its folder does not exist on disk. This must fail like the command
+        # folder checks (mirroring gap fixed).
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=["lambdas/commands/discord-cmd-weather"],
+                routes={
+                    "commands": {"weather": "discord-cmd-weather"},
+                    "autocomplete": {
+                        "weather city": "discord-autocomplete-weather-city"
+                    },
+                },
+            ),
+            commands=_weather_autocomplete_schema(),
+            lambda_mains=["lambdas/commands/discord-cmd-weather"],
+        )
+        result = run_check(repo_root)
+        assert any(
+            "discord-autocomplete-weather-city" in m and "does not exist" in m
+            for m in result["errors"]
+        )
+
 
 # ---------------------------------------------------------------------------
 # Context-menu route kinds (T3.1 vocabulary) - validate if present, tolerate absent

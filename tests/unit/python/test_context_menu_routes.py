@@ -175,6 +175,36 @@ def test_consistency_check_flags_misnamed_user_command_target(repo_root, make_mo
     )
 
 
+def test_consistency_check_uses_ascii_only_lowercasing_for_context_menu(
+    repo_root, make_module
+):
+    """Finding 1: the Python derivation must be byte-identical to the C++ router.
+
+    ``context_menu_route_suffix`` (src/include/discord_interactions/interaction.hpp)
+    lowercases ASCII bytes only and leaves multibyte UTF-8 untouched, so
+    "Über User" -> "Über-user". Python's ``str.lower()`` would fold the non-ASCII
+    Ü to "über-user", deriving a folder the router never invokes. The consistency
+    check must expect the folder the C++ router actually targets.
+    """
+    make_module(
+        "alpha",
+        {
+            "name": "alpha",
+            "commands": "discord.commands.json",
+            "lambdas": ["lambdas/usercmds/discord-usercmd-Über-user"],
+            "routes": {
+                "user_commands": {"Über User": "discord-usercmd-Über-user"}
+            },
+        },
+        commands=[{"name": "Über User", "type": 2}],
+        lambda_mains=("lambdas/usercmds/discord-usercmd-Über-user",),
+    )
+
+    result = check_route_consistency(discover_modules(repo_root))
+    assert result["errors"] == []
+    assert result["warnings"] == []
+
+
 def test_t4_1_shape_rules_fire_for_type_2_schema_entry(repo_root, make_module):
     """End-to-end: T4.1's context-menu shape rules run inside full validation."""
     make_module(

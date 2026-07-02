@@ -137,11 +137,14 @@ namespace {
 
 using discord_interactions::json;
 
-void patch_friendly_error(const std::string& application_id, const std::string& token) {
+// Returns true when the user received the friendly copy (the interaction is
+// handled), false when the message never reached Discord (missing ids, or the
+// PATCH itself failed).
+bool patch_friendly_error(const std::string& application_id, const std::string& token) {
     // Safe-error path: friendly, retryable copy. Never include internal detail
     // (exception messages, upstream bodies, SDK/JSON errors) in user-facing text.
     if (application_id.empty() || token.empty()) {
-        return;
+        return false;
     }
     try {
         discord_interactions::patch_original_response(
@@ -149,8 +152,10 @@ void patch_friendly_error(const std::string& application_id, const std::string& 
             // Ephemeral (flags: 64) via ephemeral_message.
             discord_interactions::ephemeral_message(
                 "Something went wrong handling that. Please try again."));
+        return true;
     } catch (const std::exception& patch_error) {
         std::fprintf(stderr, "__FN__ failed to PATCH error response: %s\n", patch_error.what());
+        return false;
     }
 }
 
@@ -182,7 +187,15 @@ aws::lambda_runtime::invocation_response handler(
     } catch (const discord_interactions::ModuleError& error) {
         // Expected/mapped failure: log internals to stderr, send friendly copy.
         std::fprintf(stderr, "__FN__ ModuleError code=%s category=%s: %s\n", error.code.c_str(), discord_interactions::error_category_name(error.category), error.what());
-        patch_friendly_error(application_id, token);
+        if (patch_friendly_error(application_id, token)) {
+            // The user has their mapped, friendly response — the interaction is
+            // handled. Return success so AWS async retry does not re-run an
+            // already-user-visible, deterministic failure (AD-9 spirit).
+            return aws::lambda_runtime::invocation_response::success(
+                R"({"ok":true})", "application/json");
+        }
+        // The friendly PATCH never reached Discord: fail so the retry can try
+        // again to deliver a response.
         return aws::lambda_runtime::invocation_response::failure(
             "module error", "ModuleError");
     } catch (const std::exception& ex) {

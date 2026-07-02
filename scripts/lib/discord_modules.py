@@ -27,6 +27,11 @@ _CMD_MESSAGE = 3
 _OPT_SUBCOMMAND = 1
 _OPT_SUBCOMMAND_GROUP = 2
 
+# Every valid Discord application command option type (SUB_COMMAND=1 ..
+# ATTACHMENT=11). An option with a missing or out-of-range type would pass
+# --validate-only as a leaf option, then be rejected by Discord's bulk overwrite.
+_OPTION_TYPES = frozenset(range(1, 12))
+
 # Manifest route-kind vocabulary. `user_commands` / `message_commands` are the
 # context menu kinds (T3.1); `route_map` works for every kind listed here and
 # manifest validation type-checks each kind's mapping.
@@ -124,14 +129,23 @@ def route_map(repo_root: Path, route_kind: str):
     return routes
 
 
+# Route kinds whose object form may carry an ``ephemeral_defer`` flag. Slash
+# commands opt in by their full command path; context menu commands
+# (user_commands / message_commands) opt in by their raw command name, which is
+# exactly the key the ingress matches a type-2/3 interaction against.
+EPHEMERAL_DEFER_KINDS = ("commands", "user_commands", "message_commands")
+
+
 def ephemeral_defer_routes(manifests):
     """Merged ephemeral-defer opt-ins across module manifests (T3.2 / AD-5).
 
     ``manifests`` is an iterable of parsed manifest dicts. Returns the sorted,
-    deduplicated list of command paths whose ``routes.commands`` entry uses the
-    object form with ``"ephemeral_defer": true``. Plain-string routes and
-    object routes without the flag (or with ``false``) contribute nothing;
-    only the ``commands`` route kind may opt in.
+    deduplicated list of route keys whose object-form entry sets
+    ``"ephemeral_defer": true`` — command paths from ``routes.commands`` and raw
+    context-menu command names from ``routes.user_commands`` /
+    ``routes.message_commands`` (the ingress matches context menus on the raw
+    name). Plain-string routes and object routes without the flag (or with
+    ``false``) contribute nothing; other route kinds never opt in.
     """
     paths = set()
     for manifest in manifests:
@@ -140,14 +154,15 @@ def ephemeral_defer_routes(manifests):
         routes = manifest.get("routes", {})
         if not isinstance(routes, dict):
             continue
-        mapping = routes.get("commands", {})
-        if not isinstance(mapping, dict):
-            continue
-        for route, value in mapping.items():
-            if not isinstance(route, str) or not route:
+        for kind in EPHEMERAL_DEFER_KINDS:
+            mapping = routes.get(kind, {})
+            if not isinstance(mapping, dict):
                 continue
-            if isinstance(value, dict) and value.get("ephemeral_defer") is True:
-                paths.add(route)
+            for route, value in mapping.items():
+                if not isinstance(route, str) or not route:
+                    continue
+                if isinstance(value, dict) and value.get("ephemeral_defer") is True:
+                    paths.add(route)
     return sorted(paths)
 
 
@@ -242,6 +257,17 @@ def _check_options(options, container_type, subject: str, problems):
         oname = option.get("name")
         otype = option.get("type")
         opt_subject = f"{subject} option {oname!r}"
+
+        # An option must declare a supported integer type; otherwise it silently
+        # reads as a leaf and passes --validate-only only to fail Discord later.
+        if otype is None:
+            problems.append(f"{opt_subject} is missing a type")
+        elif (
+            not isinstance(otype, int)
+            or isinstance(otype, bool)
+            or otype not in _OPTION_TYPES
+        ):
+            problems.append(f"{opt_subject} has unsupported type {otype!r}")
 
         if not _chat_name_ok(oname):
             problems.append(
@@ -516,6 +542,24 @@ def _route_targets(mapping):
     return targets
 
 
+# ASCII-only lowercase table (A-Z -> a-z). See ``context_menu_route_suffix`` in
+# src/include/discord_interactions/interaction.hpp: the C++ router lowercases
+# ASCII bytes only and leaves multibyte UTF-8 untouched. Python's ``str.lower()``
+# case-folds non-ASCII too ("Über" -> "über"), which would derive a different
+# Lambda name than the router actually invokes — so every context-menu
+# name->lambda derivation must go through this ASCII-only path to stay
+# byte-identical to the router.
+_ASCII_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def context_menu_route_suffix(name: str) -> str:
+    """Mirror the C++ ``context_menu_route_suffix``: ASCII-only lowercase +
+    spaces -> '-', leaving multibyte UTF-8 bytes untouched."""
+    return name.translate(_ASCII_LOWER).replace(" ", "-")
+
+
 def check_route_consistency(modules):
     """Cross-check command schemas, manifest routes, and Lambda folders.
 
@@ -592,6 +636,13 @@ def check_route_consistency(modules):
                     f"{prefix} autocomplete option {option_name!r} on command {path!r} "
                     f"has no route {derived!r}"
                 )
+                continue
+            # Mirror the command folder check: the routed Lambda must exist.
+            if derived not in existing_folders:
+                errors.append(
+                    f"{prefix} autocomplete option {option_name!r} on command {path!r} "
+                    f"route target Lambda folder {derived!r} does not exist in the module"
+                )
 
         # Context-menu route kinds (validate if present, tolerate absent).
         for kind, kind_prefix, cmd_type in (
@@ -609,7 +660,7 @@ def check_route_consistency(modules):
                 and isinstance(command.get("name"), str)
             }
             for cmd_name in sorted(schema_names):
-                derived = kind_prefix + cmd_name.lower().replace(" ", "-")
+                derived = kind_prefix + context_menu_route_suffix(cmd_name)
                 if cmd_name not in kind_routes:
                     errors.append(
                         f"{prefix} {kind} schema command {cmd_name!r} has no route entry"
@@ -687,11 +738,11 @@ def validate_module_manifests(repo_root: Path):
                             'must include a non-empty string "lambda"'
                         )
                     if "ephemeral_defer" in function_name:
-                        if route_kind != "commands":
+                        if route_kind not in EPHEMERAL_DEFER_KINDS:
                             problems.append(
                                 f"{module['manifest_path']} route {route!r} sets "
                                 f"ephemeral_defer on routes.{route_kind} "
-                                "(only command routes may opt in)"
+                                "(only command and context-menu routes may opt in)"
                             )
                         elif not isinstance(function_name["ephemeral_defer"], bool):
                             problems.append(
