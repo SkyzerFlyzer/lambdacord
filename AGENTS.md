@@ -109,6 +109,39 @@ changing module code.
 
 Context menu commands (interaction `data.type` 2 = user, 3 = message) follow the same mechanical rule on the raw command name: ASCII letters lowercased, spaces → `-` (`"Report User"` → `discord-usercmd-report-user`; message commands → `discord-msgcmd-<name>`). Module manifests declare them under the `user_commands` / `message_commands` route kinds; the handler consults the optional `DISCORD_USER_COMMAND_ROUTES` / `DISCORD_MESSAGE_COMMAND_ROUTES` env route maps (JSON objects keyed by the raw command name, mirroring `DISCORD_COMMAND_ROUTES`) before falling back to the mechanical derivation.
 
+### Ephemeral deferred ACKs (`ephemeral_defer`, T3.2 / AD-5)
+
+A manifest command route value may take either form:
+
+```json
+"routes": {
+  "commands": {
+    "account list": "discord-cmd-account-list",
+    "account link": { "lambda": "discord-cmd-account-link", "ephemeral_defer": true }
+  }
+}
+```
+
+The plain-string form means `ephemeral_defer: false`. The object form requires a
+non-empty string `"lambda"`; `"ephemeral_defer"` must be a boolean and is only
+legal on `commands` routes — validation rejects it on every other route kind.
+Both `discord_interactions::route_from_manifest_entry` (`routing.hpp`) and the
+Python route parsing (`scripts/lib/discord_modules.py`) accept both forms.
+
+`scripts/generate-terraform-modules.py` merges the opted-in command paths across
+all installed modules (sorted, deduplicated) and emits them as the
+`discord_ephemeral_defer_routes` local in `generated_modules.tf`; the root
+`infra/terraform/main.tf` wires that local into the ingress Lambda's
+`DISCORD_EPHEMERAL_DEFER_ROUTES` env var (omitted entirely when the list is
+empty). The ingress only parses the env var — it never reads manifests at
+runtime. On a type-2 interaction whose command path is listed it responds
+`{"type":5,"data":{"flags":64}}` instead of the plain `{"type":5}`; component
+(type 3) and modal (type 5) ACKs are unchanged. Context menu commands apply the
+same allowlist check using the raw command name (e.g. `Report User`) — the
+simplest rule consistent with exact full-path matching, since context menus
+have no derived path. Rerun the generator after changing any `ephemeral_defer`
+flag.
+
 ---
 
 ## Interaction Routing
@@ -154,6 +187,7 @@ should see it, PATCH `@original`.
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (used in local tests to point at the mock server) |
 | `DISCORD_SKIP_SIGNATURE_VERIFY` | No | Set to `1` to bypass signature verification (local testing only) |
+| `DISCORD_EPHEMERAL_DEFER_ROUTES` | No | Generated comma-separated allowlist of command paths whose type-2 deferred ACK is ephemeral (`{"type":5,"data":{"flags":64}}`). Emitted into generated Terraform by `scripts/generate-terraform-modules.py` from manifest `ephemeral_defer` flags — never hand-maintained. Entries are whitespace-trimmed and matched exactly against the full command path (`account` never matches `account link`); context menu commands are matched against the raw command name. Unset or empty ⇒ every command defers with the plain `{"type":5}`. |
 
 ### Handler/router Lambdas
 

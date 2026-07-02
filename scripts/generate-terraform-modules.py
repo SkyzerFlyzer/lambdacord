@@ -8,7 +8,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(SCRIPT_DIR / "lib"))
 
-from discord_modules import discover_modules, validate_module_manifests  # noqa: E402
+from discord_modules import (  # noqa: E402
+    discover_modules,
+    ephemeral_defer_routes,
+    validate_module_manifests,
+)
 
 
 COMMON_INPUTS = {
@@ -74,11 +78,31 @@ def generated_header():
     )
 
 
+def ephemeral_defer_csv(all_modules):
+    """Comma-separated DISCORD_EPHEMERAL_DEFER_ROUTES value across all modules.
+
+    Merged (sorted, deduplicated) via
+    :func:`discord_modules.ephemeral_defer_routes` over every installed module
+    — not just the ones that ship Terraform. Guard against command paths that
+    would break the hand-emitted HCL string literal; manifest validation keeps
+    real command paths well clear of these characters.
+    """
+    paths = ephemeral_defer_routes([module["manifest"] for module in all_modules])
+    for path in paths:
+        if any(ch in path for ch in ('"', "\\", "\n")) or "${" in path or "%{" in path:
+            raise SystemExit(
+                f"ephemeral_defer route {path!r} contains characters that cannot "
+                "be emitted into generated Terraform"
+            )
+    return ",".join(paths)
+
+
 def generate(repo_root: Path):
     validate_module_manifests(repo_root)
+    all_modules = discover_modules(repo_root)
     modules = [
         module
-        for module in discover_modules(repo_root)
+        for module in all_modules
         if isinstance(module["manifest"].get("terraform"), str)
         and module["manifest"].get("terraform")
     ]
@@ -97,7 +121,18 @@ def generate(repo_root: Path):
     locals_body = ["locals {", "  module_manifests = ["]
     if manifest_paths:
         locals_body.extend(f"{path}," for path in manifest_paths)
-    locals_body.extend(["  ]", "}"])
+    locals_body.extend(
+        [
+            "  ]",
+            "",
+            "  # Merged ephemeral-defer command paths (T3.2 / AD-5). The root",
+            "  # main.tf wires this into the ingress Lambda's",
+            "  # DISCORD_EPHEMERAL_DEFER_ROUTES env var; empty means no command",
+            "  # opts in and the env var is omitted.",
+            f'  discord_ephemeral_defer_routes = "{ephemeral_defer_csv(all_modules)}"',
+            "}",
+        ]
+    )
 
     for module in modules:
         manifest = module["manifest"]

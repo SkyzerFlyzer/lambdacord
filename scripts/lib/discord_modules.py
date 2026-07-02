@@ -102,6 +102,15 @@ def lambda_dirs(repo_root: Path):
 
 
 def route_map(repo_root: Path, route_kind: str):
+    """Merge every installed module's ``routes.<route_kind>`` mapping.
+
+    Route values may use either the plain string form (``"discord-cmd-x"``) or
+    the object form (``{"lambda": "discord-cmd-x", "ephemeral_defer": true}``,
+    T3.2). Object-form values are normalized to their target Lambda name so
+    every consumer keeps seeing ``route -> function-name string``; values that
+    fit neither form pass through unchanged (shape validation lives in
+    :func:`validate_module_manifests`).
+    """
     routes = {}
     for module in discover_modules(repo_root):
         mapping = module["manifest"].get("routes", {}).get(route_kind, {})
@@ -110,8 +119,36 @@ def route_map(repo_root: Path, route_kind: str):
         for route, function_name in mapping.items():
             if route in routes:
                 raise ModuleError(f"duplicate {route_kind} route: {route}")
-            routes[route] = function_name
+            target = _route_target_name(function_name)
+            routes[route] = target if target is not None else function_name
     return routes
+
+
+def ephemeral_defer_routes(manifests):
+    """Merged ephemeral-defer opt-ins across module manifests (T3.2 / AD-5).
+
+    ``manifests`` is an iterable of parsed manifest dicts. Returns the sorted,
+    deduplicated list of command paths whose ``routes.commands`` entry uses the
+    object form with ``"ephemeral_defer": true``. Plain-string routes and
+    object routes without the flag (or with ``false``) contribute nothing;
+    only the ``commands`` route kind may opt in.
+    """
+    paths = set()
+    for manifest in manifests:
+        if not isinstance(manifest, dict):
+            continue
+        routes = manifest.get("routes", {})
+        if not isinstance(routes, dict):
+            continue
+        mapping = routes.get("commands", {})
+        if not isinstance(mapping, dict):
+            continue
+        for route, value in mapping.items():
+            if not isinstance(route, str) or not route:
+                continue
+            if isinstance(value, dict) and value.get("ephemeral_defer") is True:
+                paths.add(route)
+    return sorted(paths)
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +428,8 @@ def _route_target_name(value):
     """Return the target Lambda name for a manifest route value.
 
     Tolerates both the plain-string form (``"discord-cmd-foo"``) and the
-    object form (``{"lambda": "discord-cmd-foo", ...}``) that a future
-    route-config task may introduce, without a hard dependency on it.
+    object form (``{"lambda": "discord-cmd-foo", "ephemeral_defer": true}``,
+    T3.2). Returns ``None`` for values that fit neither form.
     """
     if isinstance(value, str):
         return value
@@ -637,10 +674,34 @@ def validate_module_manifests(repo_root: Path):
             for route, function_name in mapping.items():
                 if not isinstance(route, str) or not route:
                     problems.append(f"{module['manifest_path']} has an invalid {route_kind} route")
-                if not isinstance(function_name, str) or not function_name:
-                    problems.append(
-                        f"{module['manifest_path']} route {route!r} has an invalid function name"
-                    )
+                if isinstance(function_name, str) and function_name:
+                    continue
+                if isinstance(function_name, dict):
+                    # Object route form (T3.2): requires a non-empty string
+                    # "lambda"; "ephemeral_defer" must be a boolean and is only
+                    # legal on command routes.
+                    target = function_name.get("lambda")
+                    if not isinstance(target, str) or not target:
+                        problems.append(
+                            f"{module['manifest_path']} route {route!r} object form "
+                            'must include a non-empty string "lambda"'
+                        )
+                    if "ephemeral_defer" in function_name:
+                        if route_kind != "commands":
+                            problems.append(
+                                f"{module['manifest_path']} route {route!r} sets "
+                                f"ephemeral_defer on routes.{route_kind} "
+                                "(only command routes may opt in)"
+                            )
+                        elif not isinstance(function_name["ephemeral_defer"], bool):
+                            problems.append(
+                                f"{module['manifest_path']} route {route!r} "
+                                "ephemeral_defer must be a boolean"
+                            )
+                    continue
+                problems.append(
+                    f"{module['manifest_path']} route {route!r} has an invalid function name"
+                )
 
         error_mapper = manifest.get("error_mapper", {})
         mapper_path = error_mapper.get("path")

@@ -169,6 +169,23 @@ are invoked asynchronously.
 Module discovery for build, route validation, and command registration is
 filesystem-based from `modules/*/module.manifest.json`.
 
+A command route value may be either a plain Lambda-name string or an object
+form that opts the command into an ephemeral deferred ACK (the "thinking…"
+state only the invoking user can see):
+
+```json
+"routes": {
+  "commands": {
+    "account list": "discord-cmd-account-list",
+    "account link": { "lambda": "discord-cmd-account-link", "ephemeral_defer": true }
+  }
+}
+```
+
+`scripts/generate-terraform-modules.py` merges every installed module's
+opt-ins into the ingress Lambda's `DISCORD_EPHEMERAL_DEFER_ROUTES` environment
+variable through the generated Terraform — rerun it after changing the flag.
+
 Terraform is different: Terraform itself cannot dynamically instantiate
 arbitrary module sources by scanning the filesystem. This repo handles that by
 generating root Terraform wiring from installed module manifests into

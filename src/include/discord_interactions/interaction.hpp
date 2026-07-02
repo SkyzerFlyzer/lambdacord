@@ -162,6 +162,45 @@ inline std::string component_prefix(const std::string& custom_id) {
     return prefix;
 }
 
+// True when `command_path` appears as an entry in the comma-separated
+// allowlist `csv` (the generated DISCORD_EPHEMERAL_DEFER_ROUTES format).
+// Entries are whitespace-trimmed at the edges and matched exactly against the
+// full command path — "account" never matches an "account link" entry. An
+// empty csv (unset env var) or an empty command path matches nothing.
+inline bool route_in_csv_allowlist(const std::string& command_path, const std::string& csv) {
+    if (command_path.empty() || csv.empty()) {
+        return false;
+    }
+
+    std::size_t start{0};
+    while (start <= csv.size()) {
+        std::size_t end = csv.find(',', start);
+        if (end == std::string::npos) {
+            end = csv.size();
+        }
+
+        std::size_t first = start;
+        std::size_t last = end;
+        while (first < last && std::isspace(static_cast<unsigned char>(csv[first]))) {
+            ++first;
+        }
+        while (last > first && std::isspace(static_cast<unsigned char>(csv[last - 1]))) {
+            --last;
+        }
+
+        if (last > first && csv.compare(first, last - first, command_path) == 0) {
+            return true;
+        }
+
+        if (end == csv.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+
+    return false;
+}
+
 inline std::string route_suffix_from_path(const std::string& path) {
     std::string suffix{};
     suffix.reserve(path.size());

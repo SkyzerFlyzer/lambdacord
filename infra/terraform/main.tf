@@ -13,9 +13,15 @@ locals {
 
   zip_root = abspath("${path.module}/../../packaged-lambdas")
 
-  discord_command_routes = merge([
-    for manifest in local.module_manifests : manifest.routes.commands
-  ]...)
+  # Route values may be the plain string form ("discord-cmd-x") or the object
+  # form ({"lambda" = "discord-cmd-x", "ephemeral_defer" = true}, T3.2).
+  # Normalize to the target Lambda name so DISCORD_COMMAND_ROUTES stays a
+  # string-to-string map for the application-command handler.
+  discord_command_routes = {
+    for route, target in merge([
+      for manifest in local.module_manifests : manifest.routes.commands
+    ]...) : route => try(target.lambda, target)
+  }
 
   discord_component_routes = merge([
     for manifest in local.module_manifests : manifest.routes.components
@@ -24,9 +30,20 @@ locals {
   router_functions = {
     "discord-interactions" = {
       zip_path = "${local.zip_root}/discord-interactions.zip"
-      environment = {
-        DISCORD_PUBLIC_KEY = var.discord_public_key
-      }
+      # local.discord_ephemeral_defer_routes is emitted by
+      # scripts/generate-terraform-modules.py into generated_modules.tf (the
+      # same generated locals block that defines local.module_manifests): the
+      # merged, comma-separated command paths whose manifest route sets
+      # "ephemeral_defer": true. An empty list omits the env var entirely —
+      # the ingress treats unset and empty identically.
+      environment = merge(
+        {
+          DISCORD_PUBLIC_KEY = var.discord_public_key
+        },
+        local.discord_ephemeral_defer_routes == "" ? {} : {
+          DISCORD_EPHEMERAL_DEFER_ROUTES = local.discord_ephemeral_defer_routes
+        }
+      )
     }
     "discord-application-command-handler" = {
       zip_path = "${local.zip_root}/discord-application-command-handler.zip"

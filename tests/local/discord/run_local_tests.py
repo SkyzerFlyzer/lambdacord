@@ -341,7 +341,11 @@ def run_ingress_tests():
             status, text = container.invoke(make_ingress_event(key_path, command_body))
             payload = parse_json(text, "ingress application command")
             assert_equal(status, 200, "ingress application command HTTP status")
-            assert_equal(json.loads(payload["body"])["type"], 5, "ingress deferred ack")
+            ack_body = json.loads(payload["body"])
+            assert_equal(ack_body["type"], 5, "ingress deferred ack")
+            # Without DISCORD_EPHEMERAL_DEFER_ROUTES the ack stays the plain
+            # {type:5} — no data/flags payload (T3.2 regression guard).
+            assert_not_in("data", ack_body, "ingress deferred ack without ephemeral env")
             logs = get_logs()
             assert_equal(len(logs), 1, "ingress application command invoke count")
             assert_equal(
@@ -391,6 +395,84 @@ def run_ingress_tests():
             body = json.loads(payload["body"])
             assert_equal(body["type"], 8, "ingress autocomplete body type")
             assert_equal(body["data"]["choices"][0]["value"], "alpha", "ingress autocomplete choice")
+
+        # T3.2: manifest-driven ephemeral deferred ACKs. With the generated
+        # DISCORD_EPHEMERAL_DEFER_ROUTES env var set on the container, a type-2
+        # command whose full path is listed gets {type:5, data:{flags:64}};
+        # unlisted commands keep the plain {type:5}. Context menu commands
+        # (data.type 2/3) match on the raw command name. Component (type 3) and
+        # modal (type 5) ACKs are unchanged.
+        ephemeral_env = dict(positive_env)
+        ephemeral_env["DISCORD_EPHEMERAL_DEFER_ROUTES"] = (
+            "example ping,other cmd,Report User"
+        )
+        with LambdaContainer("discord-interactions.zip", ephemeral_env) as container:
+            reset_mock()
+            listed_body = json.dumps(
+                {
+                    "type": 2,
+                    "data": {
+                        "name": "example",
+                        "options": [{"type": 1, "name": "ping"}],
+                    },
+                }
+            )
+            status, text = container.invoke(make_ingress_event(key_path, listed_body))
+            payload = parse_json(text, "ingress ephemeral defer listed command")
+            assert_equal(status, 200, "ingress ephemeral defer HTTP status")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress ephemeral defer ack type")
+            assert_equal(
+                body.get("data", {}).get("flags"),
+                64,
+                "ingress ephemeral defer ack flags",
+            )
+            logs = get_logs()
+            assert_equal(
+                logs[0]["function_name"],
+                "discord-application-command-handler",
+                "ingress ephemeral defer still routes to the command handler",
+            )
+
+            reset_mock()
+            unlisted_body = json.dumps({"type": 2, "data": {"name": "admin"}})
+            status, text = container.invoke(make_ingress_event(key_path, unlisted_body))
+            payload = parse_json(text, "ingress ephemeral defer unlisted command")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress unlisted command ack type")
+            assert_not_in("data", body, "ingress unlisted command ack stays plain")
+
+            reset_mock()
+            context_menu_body = json.dumps(
+                {"type": 2, "data": {"type": 2, "name": "Report User"}}
+            )
+            status, text = container.invoke(
+                make_ingress_event(key_path, context_menu_body)
+            )
+            payload = parse_json(text, "ingress ephemeral defer context menu")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress context menu ack type")
+            assert_equal(
+                body.get("data", {}).get("flags"),
+                64,
+                "ingress context menu ephemeral defer flags (raw-name match)",
+            )
+
+            reset_mock()
+            component_body = json.dumps({"type": 3, "data": {"custom_id": "pager:1"}})
+            status, text = container.invoke(make_ingress_event(key_path, component_body))
+            payload = parse_json(text, "ingress component with ephemeral env")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 6, "ingress component ack unchanged by env")
+            assert_not_in("data", body, "ingress component ack carries no flags")
+
+            reset_mock()
+            modal_body = json.dumps({"type": 5, "data": {"custom_id": "feedback:1"}})
+            status, text = container.invoke(make_ingress_event(key_path, modal_body))
+            payload = parse_json(text, "ingress modal with ephemeral env")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress modal ack unchanged by env")
+            assert_not_in("data", body, "ingress modal ack carries no flags")
 
         negative_env = dict(positive_env)
         negative_env.pop("DISCORD_SKIP_SIGNATURE_VERIFY", None)
