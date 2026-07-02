@@ -41,7 +41,7 @@ Output zips land in `packaged-lambdas/<lambda-name>.zip`. The `.gitignore` exclu
 | Library | Source |
 |---|---|
 | `aws-lambda-cpp` | Built from source (awslabs/aws-lambda-cpp) |
-| `aws-sdk-cpp` (Lambda client only) | Built from source |
+| `aws-sdk-cpp` (Lambda, DynamoDB, and KMS clients) | Built from source with `BUILD_ONLY="lambda;dynamodb;kms"` |
 | `libsodium` | Amazon Linux 2023 DNF |
 | `libcurl` | Amazon Linux 2023 DNF |
 | `nlohmann/json` | Fetched via CMake `FetchContent` at build time |
