@@ -4,10 +4,13 @@
 #include <aws/lambda/model/InvocationType.h>
 #include <aws/lambda/model/InvokeRequest.h>
 #include <aws/lambda-runtime/runtime.h>
+#include <discord_interactions/lambda_client.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -22,6 +25,15 @@ Aws::SDKOptions g_sdk_options{};
 std::shared_ptr<Aws::Lambda::LambdaClient> g_lambda_client{};
 
 class validation_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Thrown when the derived autocomplete worker Lambda does not exist
+// (ResourceNotFoundException). On the sync autocomplete path this is not an
+// error to surface: the handler answers with an empty choices result so Discord
+// simply shows no suggestions (no PATCH — autocomplete is on the 3s budget).
+class unknown_route_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };
@@ -125,14 +137,23 @@ json invoke_sync(const std::string& function_name, const json& payload) {
     auto outcome = g_lambda_client->Invoke(request);
 
     if (!outcome.IsSuccess()) {
+        const auto& error = outcome.GetError();
+        if (discord_interactions::is_function_not_found(error)) {
+            throw unknown_route_error("no worker Lambda for route " + function_name +
+                                      ": " + error.GetMessage());
+        }
         throw std::runtime_error(
-            "failed to invoke " + function_name + ": " +
-            outcome.GetError().GetMessage());
+            "failed to invoke " + function_name + ": " + error.GetMessage());
     }
 
     std::ostringstream response_payload{};
     response_payload << outcome.GetResult().GetPayload().rdbuf();
     return json::parse(response_payload.str());
+}
+
+// {type:8, data:{choices:[]}} — an autocomplete result with no suggestions.
+json empty_autocomplete_response() {
+    return json{{"type", 8}, {"data", {{"choices", json::array()}}}};
 }
 
 invocation_response handler(const invocation_request& request) {
@@ -141,6 +162,10 @@ invocation_response handler(const invocation_request& request) {
         const json response =
             invoke_sync(autocomplete_function_name(interaction), interaction);
         return invocation_response::success(response.dump(), "application/json");
+    } catch (const unknown_route_error& ex) {
+        std::cerr << "autocomplete handler unknown route: " << ex.what() << "\n";
+        return invocation_response::success(empty_autocomplete_response().dump(),
+                                            "application/json");
     } catch (const validation_error& ex) {
         std::cerr << "autocomplete handler validation failed: " << ex.what() << "\n";
         return invocation_response::failure(ex.what(), "application/json");

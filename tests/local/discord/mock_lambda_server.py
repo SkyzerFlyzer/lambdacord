@@ -22,6 +22,14 @@ STATE = {
     # when the sequence is exhausted. No match -> 200 {}.
     "discord_sequences": {},
     "discord_sequence_positions": {},
+    # Function names the mock treats as nonexistent (T3.4). Invoking one — for
+    # any invocation type — returns Lambda's real ResourceNotFoundException wire
+    # shape (HTTP 404, header x-amzn-ErrorType: ResourceNotFoundException, body
+    # {"Type":"User","message":"Function not found: ..."}) so the AWS SDK
+    # LambdaClient in the routers maps it to LambdaErrors::RESOURCE_NOT_FOUND.
+    # Unlisted unknown functions keep the pre-T3.4 behavior (202 for async,
+    # 404 {"error": ...} for sync) so existing suites are unaffected.
+    "not_found": [],
 }
 
 
@@ -39,6 +47,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("x-amzn-RequestId", "local-test-request")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _write_function_not_found(self, function_name):
+        """Emit Lambda's real ResourceNotFoundException wire shape (T3.4).
+
+        The AWS SDK classifies a service error by the x-amzn-ErrorType response
+        header, mapping "ResourceNotFoundException" to
+        LambdaErrors::RESOURCE_NOT_FOUND. Routers use that to distinguish an
+        unregistered route (friendly reply) from any other invoke failure.
+        """
+        body = {"Type": "User", "message": f"Function not found: {function_name}"}
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("x-amzn-RequestId", "local-test-request")
+        self.send_header("x-amzn-ErrorType", "ResourceNotFoundException")
         self.end_headers()
         self.wfile.write(data)
 
@@ -123,6 +149,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["discord_requests"] = []
             STATE["discord_sequences"] = payload.get("discord_sequences", {})
             STATE["discord_sequence_positions"] = {}
+            STATE["not_found"] = payload.get("not_found", [])
             self._write_json(200, {"ok": True})
             return
 
@@ -144,6 +171,13 @@ class Handler(BaseHTTPRequestHandler):
                 "payload": payload,
             }
         )
+
+        # T3.4: a function explicitly configured as nonexistent 404s with the
+        # Lambda ResourceNotFoundException shape regardless of invocation type,
+        # so routers see the SDK's RESOURCE_NOT_FOUND classification.
+        if function_name in STATE["not_found"]:
+            self._write_function_not_found(function_name)
+            return
 
         if function_name in STATE["responses"]:
             self._write_json(200, STATE["responses"][function_name])

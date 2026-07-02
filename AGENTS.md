@@ -175,6 +175,26 @@ Never return a Discord interaction response payload from an async command,
 component, or modal worker Lambda and expect Discord to show it. If the user
 should see it, PATCH `@original`.
 
+### Unknown-route handling (T3.4)
+
+When a router resolves a worker Lambda name that does not exist, the AWS SDK
+`Invoke` fails with `ResourceNotFoundException`
+(`discord_interactions::is_function_not_found`, `lambda_client.hpp`). Rather
+than let the user hang on "thinking…"/"application did not respond", the
+routers reply cleanly:
+
+- The three **async** routers (application-command, message-component, modal)
+  PATCH `@original` with the shared ephemeral copy
+  `discord_interactions::unknown_route_user_copy`
+  (`unknown_route.hpp`; `{"content": ..., "flags": 64}`) via `rest.hpp`'s
+  `discord_request` with `no_retry` (latency-sensitive path, AD-8), log the real
+  SDK error to stderr, then **still return a failed invocation** for
+  observability. The friendly copy never contains the internal error text. Every
+  other invoke failure keeps the prior behavior (log + generic failure).
+- The **sync** autocomplete router does not PATCH (it is on Discord's 3-second
+  budget); it returns an empty result `{"type":8,"data":{"choices":[]}}` so
+  Discord simply shows no suggestions.
+
 ---
 
 ## Environment Variables

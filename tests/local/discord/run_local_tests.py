@@ -72,13 +72,15 @@ def assert_not_in(needle, haystack, message):
         raise TestFailure(f"{message}: unexpected {needle!r} in {haystack!r}")
 
 
-def reset_mock(responses=None, discord_sequences=None):
+def reset_mock(responses=None, discord_sequences=None, not_found=None):
     http_json(
         "POST",
         f"http://127.0.0.1:{MOCK_PORT}/__reset",
         {
             "responses": responses or {},
             "discord_sequences": discord_sequences or {},
+            # T3.4: function names the mock should 404 as ResourceNotFound.
+            "not_found": not_found or [],
         },
     )
 
@@ -543,6 +545,9 @@ def run_application_command_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # T3.4: the friendly unknown-route PATCH targets @original via
+        # rest.hpp; point that Discord REST traffic at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
         # Installed-module routes plus a fixed test entry so the route-map
         # override path stays testable on a clean framework checkout (no
         # modules installed).
@@ -721,6 +726,38 @@ def run_application_command_tests():
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-usercmd-example-block", "mapped user context menu route")
 
+        # T3.4: an unregistered slash command derives discord-cmd-unknown-route,
+        # which the mock 404s as ResourceNotFound. The router PATCHes @original
+        # with the friendly copy (no internal error text) and STILL fails the
+        # invocation for observability.
+        reset_mock(not_found=["discord-cmd-unknown-route"])
+        status, text = container.invoke(
+            {
+                "type": 2,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"name": "unknown-route"},
+            }
+        )
+        assert_equal(status, 200, "unknown route application HTTP status")
+        # The invocation still fails for observability: the RIE returns the
+        # router's failure message as the body (same shape as the missing-name
+        # case above, which asserts on "internal error").
+        assert_in("unknown route", text, "unknown route application invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route application PATCH count")
+        assert_equal(patches[0]["application_id"], "app-unknown", "unknown route application PATCH app id")
+        assert_equal(patches[0]["interaction_token"], "tok-unknown", "unknown route application PATCH token")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route application friendly copy",
+        )
+        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route application ephemeral flag")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route application PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route application PATCH leaks no SDK error message")
+
         reset_mock()
         status, text = container.invoke({"type": 2, "data": {}})
         assert_equal(status, 200, "application handler missing name HTTP status")
@@ -736,6 +773,8 @@ def run_message_component_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # T3.4: point the friendly unknown-route PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
         "DISCORD_COMPONENT_ROUTES": json.dumps(route_map(REPO_ROOT, "components")),
     }
     with LambdaContainer("discord-message-component-handler.zip", env) as container:
@@ -744,6 +783,32 @@ def run_message_component_tests():
         assert_equal(parse_json(text, "component handler success")["ok"], True, "component handler success payload")
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-component-pager", "component handler route")
+
+        # T3.4: an unregistered component prefix derives discord-component-unknown,
+        # which the mock 404s as ResourceNotFound. The router PATCHes @original
+        # with the friendly copy and still fails the invocation.
+        reset_mock(not_found=["discord-component-unknown"])
+        status, text = container.invoke(
+            {
+                "type": 3,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"custom_id": "unknown:1"},
+            }
+        )
+        assert_equal(status, 200, "unknown route component HTTP status")
+        assert_in("unknown route", text, "unknown route component invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route component PATCH count")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route component friendly copy",
+        )
+        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route component ephemeral flag")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route component PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route component PATCH leaks no SDK error message")
 
         reset_mock()
         status, text = container.invoke({"type": 3, "data": {}})
@@ -760,6 +825,8 @@ def run_modal_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # T3.4: point the friendly unknown-route PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
     }
     with LambdaContainer("discord-modal-handler.zip", env) as container:
         status, text = container.invoke({"type": 5, "data": {"custom_id": "feedback:2"}})
@@ -767,6 +834,32 @@ def run_modal_tests():
         assert_equal(parse_json(text, "modal handler success")["ok"], True, "modal handler success payload")
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-modal-feedback", "modal handler route")
+
+        # T3.4: an unregistered modal prefix derives discord-modal-unknown, which
+        # the mock 404s as ResourceNotFound. The router PATCHes @original with
+        # the friendly copy and still fails the invocation.
+        reset_mock(not_found=["discord-modal-unknown"])
+        status, text = container.invoke(
+            {
+                "type": 5,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"custom_id": "unknown:1"},
+            }
+        )
+        assert_equal(status, 200, "unknown route modal HTTP status")
+        assert_in("unknown route", text, "unknown route modal invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route modal PATCH count")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route modal friendly copy",
+        )
+        assert_equal(patches[0]["payload"].get("flags"), 64, "unknown route modal ephemeral flag")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route modal PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route modal PATCH leaks no SDK error message")
 
         reset_mock()
         status, text = container.invoke({"type": 5, "data": {}})
@@ -817,6 +910,20 @@ def run_autocomplete_tests():
         status, text = container.invoke({"type": 4, "data": {"name": "admin"}})
         assert_equal(status, 200, "autocomplete missing focused option HTTP status")
         assert_in("no focused option", text, "autocomplete missing focused option error")
+
+        # T3.4: when the derived autocomplete worker does not exist, the sync
+        # router must NOT PATCH (it is on Discord's 3s budget); it returns an
+        # empty choices result so Discord shows no suggestions instead of
+        # "application did not respond".
+        reset_mock(not_found=["discord-autocomplete-admin-ban-user"])
+        status, text = container.invoke(payload)
+        assert_equal(status, 200, "unknown route autocomplete HTTP status")
+        response = parse_json(text, "unknown route autocomplete response")
+        assert_equal(response["type"], 8, "unknown route autocomplete body type")
+        assert_equal(response["data"]["choices"], [], "unknown route autocomplete empty choices")
+        assert_equal(
+            get_discord_requests(), [], "unknown route autocomplete performs no Discord request"
+        )
 
 
 def run_rest_tests():

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <aws/core/client/AWSError.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/lambda/LambdaClient.h>
+#include <aws/lambda/LambdaErrors.h>
 #include <aws/lambda/model/InvocationType.h>
 #include <aws/lambda/model/InvokeRequest.h>
 #include <nlohmann/json.hpp>
@@ -14,6 +16,23 @@
 namespace discord_interactions {
 
 using json = nlohmann::json;
+
+// True when an Invoke outcome's error is Lambda's ResourceNotFoundException —
+// i.e. the target function name does not exist. Routers use this to tell an
+// unregistered route apart from any other invoke failure so they can surface a
+// friendly "route unavailable" reply (T3.4) instead of a silent failure.
+//
+// Classification is by the SDK's mapped error enum: the Lambda control plane
+// answers a missing function with HTTP 404 and header
+// `x-amzn-ErrorType: ResourceNotFoundException`, which the SDK unmarshals to
+// LambdaErrors::RESOURCE_NOT_FOUND. As a defensive fallback it also matches the
+// exception name string, in case a gateway returns the shape without the enum
+// mapping.
+inline bool is_function_not_found(
+    const Aws::Client::AWSError<Aws::Lambda::LambdaErrors>& error) {
+    return error.GetErrorType() == Aws::Lambda::LambdaErrors::RESOURCE_NOT_FOUND ||
+           error.GetExceptionName() == "ResourceNotFoundException";
+}
 
 inline void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
     const char* region = std::getenv("AWS_REGION");
