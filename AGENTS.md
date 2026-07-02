@@ -113,6 +113,8 @@ changing module code.
 
 **Naming convention is load-bearing:** the application-command handler derives the Lambda name mechanically from the command path (`<group> <subcommand>` → `discord-cmd-<group>-<subcommand>`). The name must match exactly.
 
+**Route-map overrides are supported:** a manifest route may point at a non-mechanical target Lambda name (via the object route form or the router env route maps). `check_route_consistency` treats a target that matches the mechanical derivation as load-bearing (its folder must exist — error if missing), and a target that differs as a supported override (a warning to ensure it is deployed and IAM-granted, not an error). This applies symmetrically to `commands`, `user_commands`, `message_commands`, `autocomplete`, `components`, and `modals`. Terraform grants the routers `lambda:InvokeFunction` on every manifest route target (mechanical or override), so an override name still resolves at runtime.
+
 Context menu commands (interaction `data.type` 2 = user, 3 = message) follow the same mechanical rule on the raw command name: ASCII letters lowercased, spaces → `-` (`"Report User"` → `discord-usercmd-report-user`; message commands → `discord-msgcmd-<name>`). Module manifests declare them under the `user_commands` / `message_commands` route kinds; the handler consults the optional `DISCORD_USER_COMMAND_ROUTES` / `DISCORD_MESSAGE_COMMAND_ROUTES` env route maps (JSON objects keyed by the raw command name, mirroring `DISCORD_COMMAND_ROUTES`) before falling back to the mechanical derivation.
 
 ### Ephemeral deferred ACKs (`ephemeral_defer`, T3.2 / AD-5)
@@ -374,6 +376,7 @@ focused on the framework contract.
 - Downstream worker Lambdas must PATCH deferred Discord responses; Lambda
   return values are not user-visible in the async routing path.
 - Never pass raw internal exception text, upstream API bodies, AWS SDK errors, provider errors, or `ex.what()` directly to Discord users or browser-facing pages. Log internal details to stderr/CloudWatch, then map expected validation cases through module-owned structured error mappings or another explicit allowlist. For infrastructure, Discord API, external API, storage, JSON parsing, or curl failures, send a short friendly retry/action message instead.
+- Workers must branch on `ModuleError.category` before treating a caught error as deterministic: only the deterministic categories (`validation`, `auth`) warrant a friendly PATCH plus a success return, while the transient categories (`upstream`, `storage`, `configuration`, `rate_limited`, `internal` — e.g. `patch_original_response` throwing `ErrorCategory::upstream` on a 429/5xx blip) must return a Lambda failure so AWS async retry re-runs instead of burning the interaction on a permanent "Something went wrong".
 - Validate user-controlled Discord command options before calling storage/API helpers. In particular, parse numeric IDs at the command boundary and return friendly validation copy instead of relying on helper exceptions such as `std::stoll`.
 
 ### Interaction idempotency

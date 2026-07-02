@@ -876,8 +876,16 @@ Task ID format: `T<phase>.<n>`.
   folder whose name matches the derived `discord-cmd-<path>` (and vice versa: no
   orphan routes/folders).
 - **Files:** `scripts/lib/discord_modules.py` (new `check_route_consistency(...)`),
-  wire into validation used by `register-discord-commands.py` and
-  `scripts/pre-commit-static-checks.sh`; `tests/unit/python/test_route_consistency.py`.
+  wire into validation used by `register-discord-commands.py`;
+  `tests/unit/python/test_route_consistency.py`.
+  - **Review follow-up (decision):** the originally-planned wiring into
+    `scripts/pre-commit-static-checks.sh` was deliberately **declined**. That
+    script is oriented around C++ staged-file selection and per-Lambda static
+    analysis; route↔schema↔folder consistency is a whole-manifest concern already
+    enforced through `register-discord-commands.py --validate-only`. Adding it to
+    the pre-commit hook would duplicate that path against a different (staged-file)
+    selection model without added safety, so the hook wiring is intentionally not
+    implemented.
 - **Test specification:** ≥ 10 cases: fully consistent module fixture; schema command
   missing route; route missing schema entry; route → nonexistent folder; folder not
   referenced by any route (warning, not error — flag choice tested); autocomplete

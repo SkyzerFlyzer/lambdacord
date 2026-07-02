@@ -186,7 +186,18 @@ def _is_name_char(ch: str) -> bool:
     # edge of Unicode property matching exactly.
     if ch in ("-", "_"):
         return True
-    return unicodedata.category(ch)[0] in ("L", "N")
+    if unicodedata.category(ch)[0] in ("L", "N"):
+        return True
+    # Discord's real pattern also includes \p{sc=Deva}\p{sc=Thai}, which pull in
+    # combining marks (general category M) that the L*/N* rule above misses.
+    # Python's stdlib has no Unicode script properties, so approximate those two
+    # scripts by their primary Unicode blocks — Devanagari U+0900–U+097F and Thai
+    # U+0E00–U+0E7F — accepting any codepoint in range regardless of category.
+    # This is a block approximation, not an exact \p{sc=...} match.
+    cp = ord(ch)
+    if 0x0900 <= cp <= 0x097F or 0x0E00 <= cp <= 0x0E7F:
+        return True
+    return False
 
 
 def _chat_name_ok(name) -> bool:
@@ -208,18 +219,50 @@ def _check_localizations(loc, field: str, lo: int, hi: int, subject: str, proble
     for locale, value in loc.items():
         if locale not in DISCORD_LOCALES:
             problems.append(f"{subject} {field} has unknown locale {locale!r}")
-        if isinstance(value, str) and not (lo <= len(value) <= hi):
+        # A non-string value would otherwise skip the length check silently and
+        # be rejected only by Discord's bulk overwrite.
+        if not isinstance(value, str):
+            problems.append(f"{subject} {field}[{locale!r}] must be a string")
+        elif not (lo <= len(value) <= hi):
             problems.append(
                 f"{subject} {field}[{locale!r}] must be {lo}-{hi} characters"
             )
 
 
+# Option types that support a static choices list, mapped to the Python type its
+# choice `value` must have (STRING=3 -> str, INTEGER=4 -> int, NUMBER=10 -> float).
+_CHOICE_VALUE_TYPE_NAME = {3: "STRING", 4: "INTEGER", 10: "NUMBER"}
+
+
+def _choice_value_type_ok(otype, value) -> bool:
+    if otype == 3:
+        return isinstance(value, str)
+    if otype == 4:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if otype == 10:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # Other option types do not carry choices; leave value typing unchecked.
+    return True
+
+
 def _check_choices(option, subject: str, problems):
     choices = option.get("choices")
+    otype = option.get("type")
+
+    # autocomplete and a static choices list are mutually exclusive (Discord
+    # rejects declaring both on the same option).
+    if choices is not None and option.get("autocomplete") is True:
+        problems.append(
+            f"{subject} sets both autocomplete and choices, which are mutually exclusive"
+        )
+
     if choices is None:
         return
     if not isinstance(choices, list):
         problems.append(f"{subject} choices must be an array")
+        return
+    if len(choices) == 0:
+        problems.append(f"{subject} choices must not be empty when present")
         return
     if len(choices) > 25:
         problems.append(f"{subject} has {len(choices)} choices (maximum 25)")
@@ -227,12 +270,22 @@ def _check_choices(option, subject: str, problems):
         if not isinstance(choice, dict):
             problems.append(f"{subject} has a choice that is not an object")
             continue
+        if "name" not in choice or "value" not in choice:
+            problems.append(f"{subject} each choice must include a name and value")
+            continue
         cname = choice.get("name")
         if isinstance(cname, str) and len(cname) > 100:
             problems.append(f"{subject} choice name {cname!r} exceeds 100 characters")
         cvalue = choice.get("value")
         if isinstance(cvalue, str) and len(cvalue) > 100:
             problems.append(f"{subject} choice value exceeds 100 characters")
+        # The choice value type must match the option type (Discord enforces
+        # string values on STRING options, integers on INTEGER, numbers on NUMBER).
+        if otype in _CHOICE_VALUE_TYPE_NAME and not _choice_value_type_ok(otype, cvalue):
+            problems.append(
+                f"{subject} choice value type must match the "
+                f"{_CHOICE_VALUE_TYPE_NAME[otype]} option"
+            )
 
 
 def _check_options(options, container_type, subject: str, problems):
@@ -246,6 +299,25 @@ def _check_options(options, container_type, subject: str, problems):
         return
     if len(options) > 25:
         problems.append(f"{subject} has {len(options)} options (maximum 25)")
+
+    # Subcommands/groups (types 1/2) and leaf options must not coexist at the
+    # same level — Discord rejects a command/group that mixes them.
+    level_types = [
+        opt.get("type") for opt in options if isinstance(opt, dict)
+    ]
+    has_container = any(t in (_OPT_SUBCOMMAND, _OPT_SUBCOMMAND_GROUP) for t in level_types)
+    has_leaf = any(
+        isinstance(t, int)
+        and not isinstance(t, bool)
+        and t in _OPTION_TYPES
+        and t not in (_OPT_SUBCOMMAND, _OPT_SUBCOMMAND_GROUP)
+        for t in level_types
+    )
+    if has_container and has_leaf:
+        problems.append(
+            f"{subject} must not mix subcommands/groups with other options "
+            "at the same level"
+        )
 
     seen_names = set()
     seen_optional = False
@@ -408,6 +480,7 @@ def validate_command_schema(commands, module_name: str = "module"):
     problems = []
     if not isinstance(commands, list):
         return problems
+    seen_command_keys = set()
     for command in commands:
         if not isinstance(command, dict):
             problems.append(f"{module_name}: each command must be a JSON object")
@@ -416,6 +489,14 @@ def validate_command_schema(commands, module_name: str = "module"):
         if not isinstance(name, str) or not name:
             problems.append(f"{module_name}: each command must have a non-empty name")
             continue
+        # Discord treats (name, type) as the identity of a top-level command;
+        # duplicates of the same name and type collide on bulk overwrite. The
+        # default type is CHAT_INPUT (1). Use repr(type) so a non-hashable/odd
+        # type value cannot raise here.
+        command_key = (name, repr(command.get("type", _CMD_CHAT_INPUT)))
+        if command_key in seen_command_keys:
+            problems.append(f"{module_name}: duplicate command name {name!r}")
+        seen_command_keys.add(command_key)
         _check_command(command, module_name, problems)
     return problems
 
@@ -591,24 +672,67 @@ def check_route_consistency(modules):
     autocomplete and orphan-folder checks run. Context-menu route kinds
     (``user_commands`` / ``message_commands``) are validated when present and
     tolerated when absent, so this check does not hard-depend on T3.1.
+
+    Route-map overrides are a supported feature (T4.2 decision): for
+    ``commands`` / ``user_commands`` / ``message_commands`` / ``autocomplete`` /
+    ``components`` / ``modals``, a route target that EQUALS the mechanical
+    derivation keeps the folder-existence ERROR, while a target that DIFFERS is
+    a WARNING ("non-mechanical route target ... ensure it is deployed and
+    IAM-granted") — the Terraform grants invoke on every manifest route target.
     """
     errors = []
     warnings = []
+
+    def _override_warning(prefix, kind, key, target, derived):
+        return (
+            f"{prefix} {kind} route {key!r} has a non-mechanical route target "
+            f"{target!r} (mechanical derivation is {derived!r}); ensure it is "
+            "deployed and IAM-granted"
+        )
+
+    def _check_mechanical_target(prefix, kind, key, target, derived, existing_folders):
+        # Mechanical target -> folder must exist (error). Non-mechanical target
+        # -> supported override (warning). ``target is None`` means a malformed
+        # route value already flagged by manifest validation; skip it here.
+        if target is None:
+            return
+        if target == derived:
+            if target not in existing_folders:
+                errors.append(
+                    f"{prefix} {kind} route {key!r} target Lambda folder "
+                    f"{target!r} does not exist in the module"
+                )
+        else:
+            warnings.append(_override_warning(prefix, kind, key, target, derived))
 
     for module in modules:
         manifest = module["manifest"]
         module_name = manifest.get("name", "module")
         prefix = f"{module_name}:"
 
+        routes = manifest.get("routes", {})
+        if not isinstance(routes, dict):
+            routes = {}
+        existing_folders = _existing_folder_basenames(module)
+
+        # Component/modal routes have no schema to cross-check, but their target
+        # names are still mechanically derived (discord-component-<prefix> /
+        # discord-modal-<prefix>). Apply the same mechanical-vs-override policy.
+        # These run regardless of whether a command schema is present.
+        for kind, name_prefix in (
+            ("components", "discord-component-"),
+            ("modals", "discord-modal-"),
+        ):
+            for key, target in sorted(_route_targets(routes.get(kind, {})).items()):
+                derived = name_prefix + key
+                _check_mechanical_target(
+                    prefix, kind, key, target, derived, existing_folders
+                )
+
         commands = _load_module_commands_optional(module)
         if commands is None:
             continue
 
-        routes = manifest.get("routes", {})
-        if not isinstance(routes, dict):
-            routes = {}
-
-        existing_folders = _existing_folder_basenames(module)
         schema_paths, autocompletes = _collect_schema_paths_and_autocompletes(commands)
 
         command_routes = _route_targets(routes.get("commands", {}))
@@ -623,17 +747,10 @@ def check_route_consistency(modules):
                         f"{prefix} command schema path {path!r} has no commands route entry"
                     )
                     continue
-                target = command_routes[path]
-                if target != derived:
-                    errors.append(
-                        f"{prefix} commands route {path!r} points to {target!r} "
-                        f"but the derived Lambda name is {derived!r}"
-                    )
-                if target not in existing_folders:
-                    errors.append(
-                        f"{prefix} commands route {path!r} target Lambda folder "
-                        f"{target!r} does not exist in the module"
-                    )
+                _check_mechanical_target(
+                    prefix, "commands", path, command_routes[path], derived,
+                    existing_folders,
+                )
 
             # Route -> schema (reverse).
             for path in sorted(command_routes):
@@ -642,24 +759,22 @@ def check_route_consistency(modules):
                         f"{prefix} commands route {path!r} has no matching command in the schema"
                     )
 
-        # Autocomplete options must have a matching autocomplete route.
-        autocomplete_targets = set(
-            filter(None, _route_targets(routes.get("autocomplete", {})).values())
-        )
+        # Autocomplete options must have a matching autocomplete route, keyed by
+        # the "<path> <option>" route key (mirrors the command derivation).
+        autocomplete_routes = _route_targets(routes.get("autocomplete", {}))
         for path, option_name in autocompletes:
+            route_key = f"{path} {option_name}"
             derived = f"discord-autocomplete-{path.replace(' ', '-')}-{option_name}"
-            if derived not in autocomplete_targets:
+            if route_key not in autocomplete_routes:
                 errors.append(
                     f"{prefix} autocomplete option {option_name!r} on command {path!r} "
-                    f"has no route {derived!r}"
+                    f"has no route entry (expected route {route_key!r} -> {derived!r})"
                 )
                 continue
-            # Mirror the command folder check: the routed Lambda must exist.
-            if derived not in existing_folders:
-                errors.append(
-                    f"{prefix} autocomplete option {option_name!r} on command {path!r} "
-                    f"route target Lambda folder {derived!r} does not exist in the module"
-                )
+            _check_mechanical_target(
+                prefix, "autocomplete", route_key, autocomplete_routes[route_key],
+                derived, existing_folders,
+            )
 
         # Context-menu route kinds (validate if present, tolerate absent).
         for kind, kind_prefix, cmd_type in (
@@ -683,17 +798,10 @@ def check_route_consistency(modules):
                         f"{prefix} {kind} schema command {cmd_name!r} has no route entry"
                     )
                     continue
-                target = kind_routes[cmd_name]
-                if target != derived:
-                    errors.append(
-                        f"{prefix} {kind} route {cmd_name!r} points to {target!r} "
-                        f"but the derived Lambda name is {derived!r}"
-                    )
-                if target not in existing_folders:
-                    errors.append(
-                        f"{prefix} {kind} route {cmd_name!r} target Lambda folder "
-                        f"{target!r} does not exist in the module"
-                    )
+                _check_mechanical_target(
+                    prefix, kind, cmd_name, kind_routes[cmd_name], derived,
+                    existing_folders,
+                )
             for route_name in sorted(kind_routes):
                 if route_name not in schema_names:
                     errors.append(
@@ -765,6 +873,18 @@ def validate_module_manifests(repo_root: Path):
                             problems.append(
                                 f"{module['manifest_path']} route {route!r} "
                                 "ephemeral_defer must be a boolean"
+                            )
+                        elif function_name["ephemeral_defer"] is True and (
+                            isinstance(route, str) and "," in route
+                        ):
+                            # The opted-in keys are joined into the
+                            # DISCORD_EPHEMERAL_DEFER_ROUTES CSV allowlist; a comma
+                            # in the key would split it into two bogus entries.
+                            problems.append(
+                                f"{module['manifest_path']} route {route!r} sets "
+                                "ephemeral_defer but its key contains a comma, "
+                                "which breaks the DISCORD_EPHEMERAL_DEFER_ROUTES "
+                                "CSV allowlist"
                             )
                     continue
                 problems.append(

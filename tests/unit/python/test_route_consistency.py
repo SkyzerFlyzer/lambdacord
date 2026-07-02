@@ -137,9 +137,10 @@ class TestSchemaRouteConsistency:
             "discord-cmd-ping" in m and "does not exist" in m for m in result["errors"]
         )
 
-    def test_folder_name_mismatch_vs_derived_is_error(self, repo_root, make_module):
-        # The referenced folder exists, but its name is not the mechanically
-        # derived discord-cmd-ping.
+    def test_folder_name_mismatch_vs_derived_is_warning(self, repo_root, make_module):
+        # Fix 5: route-map overrides are a supported feature. A target that
+        # differs from the mechanical derivation is a WARNING (ensure it is
+        # deployed and IAM-granted), not an error.
         make_module(
             "demo",
             base_manifest(
@@ -150,9 +151,10 @@ class TestSchemaRouteConsistency:
             lambda_mains=["lambdas/commands/discord-cmd-pong"],
         )
         result = run_check(repo_root)
-        assert len(result["errors"]) == 1
-        (msg,) = result["errors"]
-        assert "discord-cmd-ping" in msg  # the derived name it should have been
+        assert result["errors"] == []
+        assert any(
+            "discord-cmd-pong" in w and "non-mechanical" in w for w in result["warnings"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +300,9 @@ class TestContextMenuKinds:
         )
         assert run_check(repo_root) == {"errors": [], "warnings": []}
 
-    def test_user_commands_present_mismatch_errors(self, repo_root, make_module):
+    def test_user_commands_present_mismatch_is_warning(self, repo_root, make_module):
+        # Fix 5: a non-mechanical context-menu target is a supported override
+        # (WARNING), not an error.
         make_module(
             "demo",
             base_manifest(
@@ -309,7 +313,11 @@ class TestContextMenuKinds:
             lambda_mains=["lambdas/usercmds/discord-usercmd-wrong"],
         )
         result = run_check(repo_root)
-        assert any("discord-usercmd-report-user" in m for m in result["errors"])
+        assert result["errors"] == []
+        assert any(
+            "discord-usercmd-wrong" in w and "non-mechanical" in w
+            for w in result["warnings"]
+        )
 
     def test_user_commands_absent_is_tolerated(self, repo_root, make_module):
         # A type-2 command in the schema with no user_commands routes declared
@@ -370,6 +378,8 @@ class TestNestedDerivation:
         assert run_check(repo_root) == {"errors": [], "warnings": []}
 
     def test_nested_path_mismatch_reports_derived_name(self, repo_root, make_module):
+        # Fix 5: a non-mechanical override on a nested path is a WARNING that
+        # names the mechanical derivation it differs from.
         make_module(
             "demo",
             base_manifest(
@@ -395,7 +405,8 @@ class TestNestedDerivation:
             lambda_mains=["lambdas/commands/discord-cmd-wrong"],
         )
         result = run_check(repo_root)
-        assert any("discord-cmd-cfg-user-add" in m for m in result["errors"])
+        assert result["errors"] == []
+        assert any("discord-cmd-cfg-user-add" in w for w in result["warnings"])
 
 
 # ---------------------------------------------------------------------------
@@ -419,15 +430,107 @@ class TestMessagePrefix:
 
 
 # ---------------------------------------------------------------------------
+# Route-override policy (Fix 5): non-mechanical command targets are warnings;
+# components/modals gain symmetric mechanical-target folder checks.
+# ---------------------------------------------------------------------------
+
+
+class TestCommandOverridePolicy:
+    def test_non_mechanical_command_target_is_warning(self, repo_root, make_module):
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=["lambdas/commands/discord-cmd-shared"],
+                routes={"commands": {"ping": "discord-cmd-shared"}},
+            ),
+            commands=[{"name": "ping", "description": "d"}],
+            lambda_mains=["lambdas/commands/discord-cmd-shared"],
+        )
+        result = run_check(repo_root)
+        assert result["errors"] == []
+        assert any(
+            "non-mechanical" in w and "IAM" in w for w in result["warnings"]
+        )
+
+    def test_mechanical_command_target_missing_folder_still_errors(
+        self, repo_root, make_module
+    ):
+        make_module(
+            "demo",
+            base_manifest(routes={"commands": {"ping": "discord-cmd-ping"}}),
+            commands=[{"name": "ping", "description": "d"}],
+        )
+        result = run_check(repo_root)
+        assert any(
+            "discord-cmd-ping" in m and "does not exist" in m for m in result["errors"]
+        )
+
+
+class TestComponentModalConsistency:
+    def test_component_mechanical_target_missing_folder_is_error(
+        self, repo_root, make_module
+    ):
+        make_module(
+            "demo",
+            base_manifest(routes={"components": {"vote": "discord-component-vote"}}),
+        )
+        result = run_check(repo_root)
+        assert any(
+            "discord-component-vote" in m and "does not exist" in m
+            for m in result["errors"]
+        )
+
+    def test_component_mechanical_target_present_passes(self, repo_root, make_module):
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=["lambdas/components/discord-component-vote"],
+                routes={"components": {"vote": "discord-component-vote"}},
+            ),
+            lambda_mains=["lambdas/components/discord-component-vote"],
+        )
+        assert run_check(repo_root)["errors"] == []
+
+    def test_component_non_mechanical_target_is_warning(self, repo_root, make_module):
+        make_module(
+            "demo",
+            base_manifest(
+                routes={"components": {"vote": "discord-component-shared-handler"}}
+            ),
+        )
+        result = run_check(repo_root)
+        assert result["errors"] == []
+        assert any(
+            "discord-component-shared-handler" in w and "non-mechanical" in w
+            for w in result["warnings"]
+        )
+
+    def test_modal_mechanical_target_missing_folder_is_error(
+        self, repo_root, make_module
+    ):
+        make_module(
+            "demo",
+            base_manifest(routes={"modals": {"feedback": "discord-modal-feedback"}}),
+        )
+        result = run_check(repo_root)
+        assert any(
+            "discord-modal-feedback" in m and "does not exist" in m
+            for m in result["errors"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # Wiring into validate_module_manifests
 # ---------------------------------------------------------------------------
 
 
 class TestWiring:
     def test_inconsistent_module_fails_manifest_validation(self, repo_root, make_module):
+        # A mechanical target whose folder is missing is still a hard error
+        # (Fix 5 only relaxes non-mechanical overrides to warnings).
         make_module(
             "demo",
-            base_manifest(routes={"commands": {"ping": "discord-cmd-nope"}}),
+            base_manifest(routes={"commands": {"ping": "discord-cmd-ping"}}),
             commands=[{"name": "ping", "description": "d"}],
         )
         with pytest.raises(ModuleError, match="does not exist"):

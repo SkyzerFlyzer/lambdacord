@@ -155,7 +155,12 @@ def test_consistency_check_tolerates_context_menu_kinds(repo_root, make_module):
     assert result["warnings"] == []
 
 
-def test_consistency_check_flags_misnamed_user_command_target(repo_root, make_module):
+def test_consistency_check_warns_on_non_mechanical_user_command_target(
+    repo_root, make_module
+):
+    # Fix 5: route-map overrides are supported. A user-command target that
+    # differs from the mechanical derivation is a WARNING (deploy + IAM-grant),
+    # not an error.
     make_module(
         "alpha",
         {
@@ -169,9 +174,10 @@ def test_consistency_check_flags_misnamed_user_command_target(repo_root, make_mo
     )
 
     result = check_route_consistency(discover_modules(repo_root))
+    assert result["errors"] == []
     assert any(
-        "derived Lambda name is 'discord-usercmd-report-user'" in error
-        for error in result["errors"]
+        "discord-usercmd-report-user" in warning and "non-mechanical" in warning
+        for warning in result["warnings"]
     )
 
 

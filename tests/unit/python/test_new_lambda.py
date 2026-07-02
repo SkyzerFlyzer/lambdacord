@@ -327,6 +327,84 @@ class TestCommandTemplate:
         block = self._module_error_block(repo_root, make_module)
         assert "invocation_response::failure" in block
 
+    def test_module_error_branches_on_category(self, repo_root, make_module):
+        # Fix 1: the worker must branch on ModuleError.category. Only the
+        # deterministic categories (validation, auth) are treated as a permanent,
+        # user-visible failure that returns success once the friendly PATCH lands.
+        block = self._module_error_block(repo_root, make_module)
+        assert "error.category" in block
+        assert "ErrorCategory::validation" in block
+        assert "ErrorCategory::auth" in block
+
+    def test_transient_category_returns_failure_for_retry(self, repo_root, make_module):
+        # Fix 1: transient categories (upstream/storage/configuration/
+        # rate_limited/internal — e.g. patch_original_response throws
+        # ErrorCategory::upstream on a 429/5xx blip) must fail so AWS async retry
+        # re-runs rather than becoming a permanent "Something went wrong".
+        block = self._module_error_block(repo_root, make_module)
+        assert "invocation_response::failure" in block
+        assert "upstream" in block
+
+
+# ---------------------------------------------------------------------------
+# Clobber guard: refuse when target main.cpp already exists (Fix 2)
+# ---------------------------------------------------------------------------
+
+
+class TestClobberGuard:
+    def test_refuses_existing_main_cpp_without_route(self, repo_root, make_module):
+        # A hand-written main.cpp with no manifest route must NOT be silently
+        # overwritten just because no route entry exists yet.
+        make_module(
+            "demo",
+            base_manifest(),
+            commands=[],
+            lambda_mains=["lambdas/commands/discord-cmd-group-sub"],
+        )
+        main_cpp = (repo_root / "modules" / "demo" / "lambdas" / "commands"
+                    / "discord-cmd-group-sub" / "main.cpp")
+        main_cpp.write_text("// hand written, do not clobber\n", encoding="utf-8")
+        before = snapshot(repo_root / "modules")
+        result = run_cli(repo_root, "--module", "demo", "--kind", "command",
+                         "--path", "group sub")
+        assert result.returncode != 0
+        assert "exist" in (result.stderr + result.stdout).lower()
+        assert snapshot(repo_root / "modules") == before
+
+
+# ---------------------------------------------------------------------------
+# Input hygiene (Fix 7): reject ':' in component/modal prefixes and uppercase
+# ASCII in command paths at plan time.
+# ---------------------------------------------------------------------------
+
+
+class TestInputHygiene:
+    def test_rejects_component_path_with_colon(self, repo_root, make_module):
+        make_module("demo", base_manifest())
+        before = snapshot(repo_root / "modules")
+        result = run_cli(repo_root, "--module", "demo", "--kind", "component",
+                         "--path", "vote:extra")
+        assert result.returncode != 0
+        assert ":" in (result.stderr + result.stdout)
+        assert snapshot(repo_root / "modules") == before
+
+    def test_rejects_modal_path_with_colon(self, repo_root, make_module):
+        make_module("demo", base_manifest())
+        before = snapshot(repo_root / "modules")
+        result = run_cli(repo_root, "--module", "demo", "--kind", "modal",
+                         "--path", "feed:back")
+        assert result.returncode != 0
+        assert snapshot(repo_root / "modules") == before
+
+    def test_rejects_command_path_with_uppercase(self, repo_root, make_module):
+        make_module("demo", base_manifest(), commands=[])
+        before = snapshot(repo_root / "modules")
+        result = run_cli(repo_root, "--module", "demo", "--kind", "command",
+                         "--path", "Group sub")
+        assert result.returncode != 0
+        assert "lowercase" in (result.stderr + result.stdout).lower()
+        assert snapshot(repo_root / "modules") == before
+
 
 # ---------------------------------------------------------------------------
 # Template content — autocomplete kind (sync {type:8} choices)

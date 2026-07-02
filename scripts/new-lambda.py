@@ -185,17 +185,30 @@ aws::lambda_runtime::invocation_response handler(
         return aws::lambda_runtime::invocation_response::success(
             R"({"ok":true})", "application/json");
     } catch (const discord_interactions::ModuleError& error) {
-        // Expected/mapped failure: log internals to stderr, send friendly copy.
+        // Branch on error.category before treating a caught error as
+        // deterministic. Only the deterministic categories (validation, auth)
+        // are permanent, user-visible failures. The transient categories
+        // (upstream, storage, configuration, rate_limited, internal) include
+        // blips like patch_original_response throwing ErrorCategory::upstream on
+        // a 429/5xx — those MUST fail so AWS async retry re-runs instead of
+        // burning the interaction on a permanent "Something went wrong".
         std::fprintf(stderr, "__FN__ ModuleError code=%s category=%s: %s\n", error.code.c_str(), discord_interactions::error_category_name(error.category), error.what());
-        if (patch_friendly_error(application_id, token)) {
-            // The user has their mapped, friendly response — the interaction is
-            // handled. Return success so AWS async retry does not re-run an
-            // already-user-visible, deterministic failure (AD-9 spirit).
-            return aws::lambda_runtime::invocation_response::success(
-                R"({"ok":true})", "application/json");
+        const bool deterministic =
+            error.category == discord_interactions::ErrorCategory::validation ||
+            error.category == discord_interactions::ErrorCategory::auth;
+        if (deterministic) {
+            if (patch_friendly_error(application_id, token)) {
+                // The user has their mapped, friendly response — the interaction
+                // is handled. Return success so AWS async retry does not re-run
+                // an already-user-visible, deterministic failure (AD-9 spirit).
+                return aws::lambda_runtime::invocation_response::success(
+                    R"({"ok":true})", "application/json");
+            }
+            // The friendly PATCH never reached Discord: fall through to failure
+            // so the retry can try again to deliver a response.
         }
-        // The friendly PATCH never reached Discord: fail so the retry can try
-        // again to deliver a response.
+        // Transient category (or a deterministic case whose PATCH never landed):
+        // fail so AWS async retry re-runs.
         return aws::lambda_runtime::invocation_response::failure(
             "module error", "ModuleError");
     } catch (const std::exception& ex) {
@@ -330,6 +343,15 @@ def build_plan(module_dir, kind, path_tokens, option):
             f"route {route_key!r} already exists under routes.{route_kind}; refusing"
         )
 
+    # Refuse to clobber a hand-written main.cpp even when no route entry exists
+    # yet: a folder with source but no route would otherwise be silently
+    # overwritten (apply_plan writes unconditionally).
+    main_cpp = module_dir / lambda_rel / "main.cpp"
+    if main_cpp.exists():
+        raise ModuleError(
+            f"{main_cpp} already exists; refusing to overwrite it"
+        )
+
     return {
         "name": name,
         "route_kind": route_kind,
@@ -444,9 +466,26 @@ def run(args):
             raise ModuleError("--kind autocomplete requires --option")
     if args.kind in ("component", "modal") and len(path_tokens) != 1:
         raise ModuleError(f"--kind {args.kind} --path must be a single-token prefix")
+    if args.kind in ("component", "modal") and ":" in path_tokens[0]:
+        # The routers split a component/modal custom_id at the first ':' to find
+        # the prefix, so a prefix containing ':' could never match at runtime.
+        raise ModuleError(
+            f"--kind {args.kind} --path must not contain ':' — the router splits "
+            "the custom_id at the first ':', so a prefix with ':' can never match"
+        )
     if args.kind == "command" and len(path_tokens) > 3:
         raise ModuleError("--path may have at most 3 space-separated parts "
                           "(group -> subcommand is the deepest legal chain)")
+    if args.kind == "command":
+        # Fail fast on uppercase ASCII: Discord command names must be lowercase,
+        # and the derived Lambda name is case-sensitive. Catch it here instead of
+        # at the later --validate-only step.
+        for token in path_tokens:
+            if any("A" <= ch <= "Z" for ch in token):
+                raise ModuleError(
+                    f"--path token {token!r} contains uppercase ASCII; command "
+                    "paths must be lowercase"
+                )
 
     modules_root = resolve_modules_root(args.modules_root)
     module_dir = modules_root / args.module

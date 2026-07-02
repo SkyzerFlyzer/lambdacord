@@ -274,6 +274,24 @@ def test_validation_rejects_non_boolean_ephemeral_defer(repo_root, make_module):
         validate_module_manifests(repo_root)
 
 
+def test_validation_rejects_comma_in_ephemeral_defer_route_key(repo_root, make_module):
+    # Fix 6: a comma in an ephemeral_defer route key would silently break the
+    # DISCORD_EPHEMERAL_DEFER_ROUTES CSV allowlist, so it must be rejected.
+    make_module(
+        "demo",
+        {
+            "name": "demo",
+            "routes": {
+                "commands": {
+                    "a,b": {"lambda": "discord-cmd-ab", "ephemeral_defer": True}
+                }
+            },
+        },
+    )
+    with pytest.raises(ModuleError, match="comma"):
+        validate_module_manifests(repo_root)
+
+
 def test_validation_rejects_object_route_missing_lambda(repo_root, make_module):
     make_module(
         "demo",

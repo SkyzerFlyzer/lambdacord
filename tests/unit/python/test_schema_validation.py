@@ -100,6 +100,17 @@ class TestChatInputNameCharset:
         # Unicode-aware approximation of \p{L}: category L* accepted.
         assert problems_for([{"name": "café", "description": "d"}]) == ""
 
+    def test_accepts_devanagari_with_combining_mark(self):
+        # Fix 4: Discord's pattern includes \p{sc=Deva}, which pulls in combining
+        # marks (category M). "नाम" contains U+093E (category Mc); the Devanagari
+        # block approximation must accept it.
+        assert problems_for([{"name": "नाम", "description": "d"}]) == ""
+
+    def test_accepts_thai_with_combining_mark(self):
+        # Fix 4: "กั" is U+0E01 (Lo) + U+0E31 (Mn, a Thai combining mark). The
+        # Thai block approximation must accept the combining mark.
+        assert problems_for([{"name": "กั", "description": "d"}]) == ""
+
 
 # ---------------------------------------------------------------------------
 # CHAT_INPUT name: lowercase
@@ -360,6 +371,160 @@ class TestChoices:
     def test_rejects_overlong_choice_string_value(self):
         msg = problems_for([self._cmd([{"name": "n", "value": "v" * 101}])])
         assert "choice value" in msg and "exceeds 100 characters" in msg
+
+
+# ---------------------------------------------------------------------------
+# Relational choice/option checks (Fix 3): value type, required keys, non-empty,
+# autocomplete/choices exclusivity, subcommand/leaf mixing, duplicate command
+# names, non-string localization values.
+# ---------------------------------------------------------------------------
+
+
+class TestChoiceValueType:
+    def _cmd(self, otype, value):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {
+                    "type": otype,
+                    "name": "o",
+                    "description": "d",
+                    "choices": [{"name": "n", "value": value}],
+                }
+            ],
+        }
+
+    def test_accepts_string_value_for_string_option(self):
+        assert problems_for([self._cmd(3, "hello")]) == ""
+
+    def test_accepts_integer_value_for_integer_option(self):
+        assert problems_for([self._cmd(4, 5)]) == ""
+
+    def test_accepts_number_value_for_number_option(self):
+        assert problems_for([self._cmd(10, 1.5)]) == ""
+
+    def test_rejects_integer_value_for_string_option(self):
+        msg = problems_for([self._cmd(3, 5)])
+        assert "must match the STRING option" in msg
+
+    def test_rejects_string_value_for_integer_option(self):
+        msg = problems_for([self._cmd(4, "5")])
+        assert "must match the INTEGER option" in msg
+
+    def test_rejects_string_value_for_number_option(self):
+        msg = problems_for([self._cmd(10, "x")])
+        assert "must match the NUMBER option" in msg
+
+
+class TestChoiceRequiresNameAndValue:
+    def _cmd(self, choice):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": 3, "name": "o", "description": "d", "choices": [choice]}
+            ],
+        }
+
+    def test_rejects_choice_missing_value(self):
+        msg = problems_for([self._cmd({"name": "n"})])
+        assert "must include a name and value" in msg
+
+    def test_rejects_choice_missing_name(self):
+        msg = problems_for([self._cmd({"value": "v"})])
+        assert "must include a name and value" in msg
+
+
+class TestChoicesNonEmpty:
+    def test_rejects_empty_choices_array(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "options": [{"type": 3, "name": "o", "description": "d", "choices": []}],
+        }
+        msg = problems_for([cmd])
+        assert "must not be empty" in msg
+
+
+class TestAutocompleteChoicesExclusive:
+    def test_rejects_autocomplete_with_choices(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {
+                    "type": 3,
+                    "name": "o",
+                    "description": "d",
+                    "autocomplete": True,
+                    "choices": [{"name": "n", "value": "v"}],
+                }
+            ],
+        }
+        msg = problems_for([cmd])
+        assert "mutually exclusive" in msg
+
+    def test_accepts_autocomplete_without_choices(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": 3, "name": "o", "description": "d", "autocomplete": True}
+            ],
+        }
+        assert problems_for([cmd]) == ""
+
+
+class TestSubcommandLeafMixing:
+    def test_rejects_mixed_subcommand_and_leaf(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": 1, "name": "sub", "description": "d"},
+                {"type": 3, "name": "leaf", "description": "d"},
+            ],
+        }
+        msg = problems_for([cmd])
+        assert "must not mix subcommands" in msg
+
+    def test_accepts_all_leaf_options(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": 3, "name": "a", "description": "d"},
+                {"type": 4, "name": "b", "description": "d"},
+            ],
+        }
+        assert problems_for([cmd]) == ""
+
+
+class TestDuplicateCommandNames:
+    def test_rejects_duplicate_same_type(self):
+        cmds = [
+            {"name": "ping", "description": "d"},
+            {"name": "ping", "description": "d"},
+        ]
+        msg = problems_for(cmds)
+        assert "duplicate command name" in msg
+
+    def test_accepts_same_name_different_type(self):
+        # A chat-input "report" and a user context-menu "report" may coexist.
+        cmds = [{"name": "report", "description": "d"}, {"name": "report", "type": 2}]
+        assert problems_for(cmds) == ""
+
+
+class TestLocalizationValueType:
+    def test_rejects_non_string_localization_value(self):
+        cmd = {
+            "name": "cmd",
+            "description": "d",
+            "name_localizations": {"en-US": 123},
+        }
+        msg = problems_for([cmd])
+        assert "must be a string" in msg
 
 
 # ---------------------------------------------------------------------------
