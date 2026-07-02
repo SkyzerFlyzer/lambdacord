@@ -216,6 +216,7 @@ routers reply cleanly:
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (local testing) |
 | `DISCORD_IDEMPOTENCY_TABLE` | No | DynamoDB table name for durable cross-container interaction dedup (Phase 5 / AD-9). Unset or empty ⇒ both `idempotency_store.hpp` primitives no-op to "proceed". Opt-in per worker Lambda; provision the table via the root `discord_idempotency_table_enabled` Terraform variable. |
+| `AWS_DYNAMODB_ENDPOINT` | No | Override DynamoDB endpoint for the `idempotency_store.hpp` warm-global client (local testing — mirrors `AWS_LAMBDA_ENDPOINT`; the `dedup` suite points it at the mock server) |
 
 ### Discord REST helpers
 
@@ -242,7 +243,7 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 1. Verifies Docker is available and the RIE image can run on `linux/arm64`.
 2. Starts `tests/local/discord/mock_lambda_server.py` on port `19001`.
 3. Extracts each zip from `packaged-lambdas/` into a temp directory and mounts it as `/var/runtime` inside an RIE container.
-4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing, REST layer (`rest`).
+4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing, REST layer (`rest`), durable interaction dedup (`dedup`).
 5. Tears everything down and prints `All local Discord Lambda tests passed.` on success.
 
 **All zips must be built before running tests.** Build them all first:
@@ -268,6 +269,19 @@ followup via `webhook_messages.hpp`. Pointed at the mock server with
 `DISCORD_API_BASE_URL`, it proves the T2.1 retry loop (429-then-200 sequence →
 two recorded attempts) and the T2.2 followup/delete paths against live HTTP.
 
+The `dedup` suite uses `tests/local/discord/fixtures/discord-cmd-test-dedup/`,
+a worker running the AD-9 completion-marker flow (`was_completed` → PATCH →
+`record_completion` from `idempotency_store.hpp`) with a warm-global
+`DynamoDBClient` pointed at the mock server via `AWS_DYNAMODB_ENDPOINT` and
+opted in via `DISCORD_IDEMPOTENCY_TABLE`. It proves that a duplicate delivery
+of a success PATCHes exactly once (second run returns `skipped:true`), that a
+run crashing **before** the PATCH records nothing so the retry re-runs and the
+user still gets a response (the case a claim-at-start design fails), that
+distinct interaction ids stay independent, and that unsetting
+`DISCORD_IDEMPOTENCY_TABLE` opts the whole feature out. The crash is simulated
+with a test-only `test_fail_before_patch` field in the interaction payload
+(payload, not env, so one warm container serves both the crash and the retry).
+
 ### Mock server API
 
 The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:
@@ -279,6 +293,8 @@ The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:
 - `GET /__discord_requests` — every Discord-API-shaped request (any method on `/api/v<N>/...`), in order: `[{method, path, body}]`
 - `GET /__discord_patches` — legacy log of `PATCH .../messages/@original` requests: `[{application_id, interaction_token, payload}]` (kept for pre-T2.3 suites; superseded by `__discord_requests`)
 - `POST /2015-03-31/functions/<name>/invocations` — Lambda-style invocation endpoint
+- `POST /` with header `X-Amz-Target: DynamoDB_20120810.<Op>` — minimal DynamoDB surface (T5.3): `PutItem` (honors `ConditionExpression` `attribute_not_exists(interaction_id)` → `400` with the real `ConditionalCheckFailedException` `__type` shape when the id exists; unconditional puts overwrite) and `GetItem` (`{"Item": ...}` or `{}`) against a single in-memory table keyed by the `interaction_id` `S` value. `__reset` clears the table.
+- `GET /__dynamodb_table` — debug view of the current mock DynamoDB items, keyed by interaction id
 
 ---
 

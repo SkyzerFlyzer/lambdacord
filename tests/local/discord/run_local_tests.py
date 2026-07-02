@@ -100,6 +100,12 @@ def get_discord_requests():
     return payload
 
 
+def get_dynamodb_table():
+    """Current mock DynamoDB items, keyed by interaction_id S value (T5.3)."""
+    _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__dynamodb_table")
+    return payload
+
+
 def ensure_fixture_zip(fixture_dir):
     """Build a test-only fixture Lambda zip on demand and return its zip name.
 
@@ -1027,6 +1033,125 @@ def run_rest_tests():
         )
 
 
+def run_dedup_tests():
+    # T5.3: integration coverage for the durable completion-marker dedup
+    # (idempotency_store.hpp / T5.2, AD-9). The discord-cmd-test-dedup fixture
+    # runs the check -> act -> PATCH -> record flow against the mock server's
+    # minimal DynamoDB surface (PutItem/GetItem routed on the X-Amz-Target
+    # header), pointed there via AWS_DYNAMODB_ENDPOINT. The crash-recovery case
+    # is the point of AD-9: a claim-at-start implementation fails it.
+    zip_name = ensure_fixture_zip(FIXTURES_DIR / "discord-cmd-test-dedup")
+
+    application_id = "test-app"
+    token = "test-token"
+
+    def interaction(interaction_id, fail_before_patch=False):
+        payload = {
+            "type": 2,
+            "id": interaction_id,
+            "application_id": application_id,
+            "token": token,
+            "data": {"name": "test", "options": [{"type": 1, "name": "dedup"}]},
+        }
+        if fail_before_patch:
+            # Test-only crash simulation flag, read from the interaction JSON
+            # (payload-field approach — see the fixture's header comment).
+            payload["test_fail_before_patch"] = True
+        return payload
+
+    env = {
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_SESSION_TOKEN": "test",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        # Opt in to the durable dedup and point its warm DynamoDB client at
+        # the mock server (mirrors the AWS_LAMBDA_ENDPOINT pattern).
+        "DISCORD_IDEMPOTENCY_TABLE": "test-idempotency",
+        "AWS_DYNAMODB_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # rest.hpp's discord_api_base_url() honors this override, pointing the
+        # fixture's @original PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
+    }
+    with LambdaContainer(zip_name, env) as container:
+        # (1) Duplicate success: the same interaction id invoked twice PATCHes
+        # exactly once — the second run sees the completion record and skips.
+        reset_mock()
+        status, text = container.invoke(interaction("dedup-dup-1"))
+        assert_equal(status, 200, "dedup first invoke HTTP status")
+        first = parse_json(text, "dedup first invoke")
+        assert_equal(first.get("ok"), True, "dedup first invoke ok")
+        assert_not_in("skipped", first, "dedup first invoke is not skipped")
+
+        status, text = container.invoke(interaction("dedup-dup-1"))
+        assert_equal(status, 200, "dedup duplicate invoke HTTP status")
+        second = parse_json(text, "dedup duplicate invoke")
+        assert_equal(second.get("ok"), True, "dedup duplicate invoke ok")
+        assert_equal(second.get("skipped"), True, "dedup duplicate invoke skipped")
+
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "dedup duplicate success PATCH count")
+        assert_equal(
+            patches[0]["application_id"], application_id, "dedup PATCH application id"
+        )
+        assert_equal(patches[0]["interaction_token"], token, "dedup PATCH token")
+        table = get_dynamodb_table()
+        assert_in("dedup-dup-1", table, "dedup completion record stored")
+
+        # (2) Crash recovery (the AD-9 case): a run that fails BEFORE the PATCH
+        # records nothing, so the retry re-runs and the user gets a response.
+        # A claim-at-start implementation records the claim before crashing and
+        # suppresses the retry — failing this test is the point of it.
+        reset_mock()
+        status, text = container.invoke(
+            interaction("dedup-crash-1", fail_before_patch=True)
+        )
+        assert_equal(status, 200, "dedup crash invoke HTTP status")
+        assert_in("simulated crash", text, "dedup crash invoke fails the invocation")
+        assert_equal(get_discord_patches(), [], "dedup crash invoke performs no PATCH")
+        assert_not_in(
+            "dedup-crash-1", get_dynamodb_table(), "dedup crash invoke records nothing"
+        )
+
+        status, text = container.invoke(interaction("dedup-crash-1"))
+        assert_equal(status, 200, "dedup retry invoke HTTP status")
+        retry = parse_json(text, "dedup retry invoke")
+        assert_equal(retry.get("ok"), True, "dedup retry invoke ok")
+        assert_not_in("skipped", retry, "dedup retry re-runs instead of skipping")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "dedup crash retry PATCH count")
+        assert_in("dedup-crash-1", get_dynamodb_table(), "dedup retry records completion")
+
+        # (3) Two distinct interaction ids are independent: two PATCHes.
+        reset_mock()
+        for interaction_id in ("dedup-distinct-1", "dedup-distinct-2"):
+            status, text = container.invoke(interaction(interaction_id))
+            assert_equal(status, 200, f"dedup {interaction_id} HTTP status")
+            assert_equal(
+                parse_json(text, f"dedup {interaction_id}").get("ok"),
+                True,
+                f"dedup {interaction_id} ok",
+            )
+        assert_equal(len(get_discord_patches()), 2, "dedup distinct ids PATCH count")
+
+    # (4) Opt-out: without DISCORD_IDEMPOTENCY_TABLE every primitive no-ops to
+    # "proceed", so the same id PATCHes twice.
+    optout_env = dict(env)
+    optout_env.pop("DISCORD_IDEMPOTENCY_TABLE")
+    with LambdaContainer(zip_name, optout_env) as container:
+        reset_mock()
+        for attempt in (1, 2):
+            status, text = container.invoke(interaction("dedup-optout-1"))
+            assert_equal(status, 200, f"dedup opt-out invoke #{attempt} HTTP status")
+            result = parse_json(text, f"dedup opt-out invoke #{attempt}")
+            assert_equal(result.get("ok"), True, f"dedup opt-out invoke #{attempt} ok")
+            assert_not_in(
+                "skipped", result, f"dedup opt-out invoke #{attempt} never skips"
+            )
+        assert_equal(len(get_discord_patches()), 2, "dedup opt-out PATCH count")
+        assert_equal(get_dynamodb_table(), {}, "dedup opt-out stores nothing")
+
+
 def assert_before(text, earlier, later, message):
     earlier_index = text.find(earlier)
     later_index = text.find(later)
@@ -1463,6 +1588,7 @@ def main():
             "modal",
             "autocomplete",
             "rest",
+            "dedup",
             "nitrado-responses",
         ],
         help="Run only the named suite. Pass multiple times to run several suites.",
@@ -1476,10 +1602,19 @@ def main():
         "modal",
         "autocomplete",
         "rest",
+        "dedup",
         "nitrado-responses",
     ]
 
-    docker_suites = {"ingress", "application", "component", "modal", "autocomplete", "rest"}
+    docker_suites = {
+        "ingress",
+        "application",
+        "component",
+        "modal",
+        "autocomplete",
+        "rest",
+        "dedup",
+    }
     mock_server = None
     if any(suite in docker_suites for suite in suites):
         docker_preflight()
@@ -1506,6 +1641,8 @@ def main():
                 run_autocomplete_tests()
             elif suite == "rest":
                 run_rest_tests()
+            elif suite == "dedup":
+                run_dedup_tests()
             elif suite == "nitrado-responses":
                 run_nitrado_command_response_tests()
     finally:

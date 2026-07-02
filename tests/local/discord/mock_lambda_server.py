@@ -30,6 +30,18 @@ STATE = {
     # Unlisted unknown functions keep the pre-T3.4 behavior (202 for async,
     # 404 {"error": ...} for sync) so existing suites are unaffected.
     "not_found": [],
+    # Minimal in-memory DynamoDB table for the T5.3 dedup suite: items keyed by
+    # their interaction_id "S" value. The DynamoDB JSON protocol is a POST to
+    # "/" with the operation in the X-Amz-Target header
+    # (DynamoDB_20120810.PutItem / DynamoDB_20120810.GetItem), routed before
+    # the Discord/function handlers. Debug-inspectable via GET /__dynamodb_table.
+    "dynamodb_table": {},
+}
+
+DYNAMODB_TARGET_PREFIX = "DynamoDB_20120810."
+CONDITIONAL_CHECK_FAILED = {
+    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+    "message": "The conditional request failed",
 }
 
 
@@ -79,6 +91,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/__discord_requests":
             self._write_json(200, STATE["discord_requests"])
+            return
+
+        if self.path == "/__dynamodb_table":
+            self._write_json(200, STATE["dynamodb_table"])
             return
 
         if self._handle_discord_api("GET"):
@@ -140,6 +156,55 @@ class Handler(BaseHTTPRequestHandler):
         self._write_json(200, {})
         return True
 
+    def _handle_dynamodb(self):
+        """Answer minimal DynamoDB PutItem/GetItem requests (T5.3).
+
+        The DynamoDB JSON protocol posts to "/" and names the operation in the
+        X-Amz-Target header, so this is routed on that header BEFORE the
+        Discord and Lambda-invocation handlers. Items live in an in-memory
+        dict keyed by the interaction_id "S" value. PutItem honors the
+        ConditionExpression "attribute_not_exists(interaction_id)" (the T5.2
+        claim guard) by answering DynamoDB's real ConditionalCheckFailedException
+        shape (400 + __type) when the id already exists; without a condition it
+        overwrites (the completion marker). GetItem answers {"Item": ...} on a
+        hit and {} on a miss, matching the real service.
+        """
+        target = self.headers.get("X-Amz-Target", "")
+        if not target.startswith(DYNAMODB_TARGET_PREFIX):
+            return False
+
+        operation = target[len(DYNAMODB_TARGET_PREFIX):]
+        payload = self._read_json()
+
+        if operation == "PutItem":
+            item = payload.get("Item", {})
+            interaction_id = item.get("interaction_id", {}).get("S", "")
+            condition = payload.get("ConditionExpression", "")
+            if (
+                condition == "attribute_not_exists(interaction_id)"
+                and interaction_id in STATE["dynamodb_table"]
+            ):
+                self._write_json(400, CONDITIONAL_CHECK_FAILED)
+                return True
+            STATE["dynamodb_table"][interaction_id] = item
+            self._write_json(200, {})
+            return True
+
+        if operation == "GetItem":
+            interaction_id = payload.get("Key", {}).get("interaction_id", {}).get("S", "")
+            stored = STATE["dynamodb_table"].get(interaction_id)
+            self._write_json(200, {} if stored is None else {"Item": stored})
+            return True
+
+        self._write_json(
+            400,
+            {
+                "__type": "com.amazon.coral.service#UnknownOperationException",
+                "message": f"unsupported mock DynamoDB operation: {operation}",
+            },
+        )
+        return True
+
     def do_POST(self):
         if self.path == "/__reset":
             payload = self._read_json()
@@ -150,7 +215,11 @@ class Handler(BaseHTTPRequestHandler):
             STATE["discord_sequences"] = payload.get("discord_sequences", {})
             STATE["discord_sequence_positions"] = {}
             STATE["not_found"] = payload.get("not_found", [])
+            STATE["dynamodb_table"] = {}
             self._write_json(200, {"ok": True})
+            return
+
+        if self._handle_dynamodb():
             return
 
         if self._handle_discord_api("POST"):
