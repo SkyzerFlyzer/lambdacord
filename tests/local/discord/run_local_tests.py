@@ -147,6 +147,11 @@ class LambdaContainer:
             LAMBDA_PLATFORM,
             "--name",
             self.container_name,
+            # Docker Desktop resolves host.docker.internal natively; native Linux
+            # dockerd needs the host-gateway mapping for containers to reach the
+            # mock server on the host.
+            "--add-host",
+            "host.docker.internal:host-gateway",
             "-p",
             f"{self.port}:8080",
             "-v",
