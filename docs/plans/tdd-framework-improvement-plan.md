@@ -150,9 +150,10 @@ Subagents must treat these as settled; do not re-litigate them mid-task.
   duplicated parsing in entry-point scripts.
 - **AD-7: No new third-party runtime dependencies** beyond what the builder image
   already has (libsodium, libcurl, aws-lambda-cpp, aws-sdk-cpp, nlohmann/json).
-  doctest is test-only. One sanctioned extension: Phase 5 (T5.1) adds the **DynamoDB
-  client** to the aws-sdk-cpp build in the builder image — first-party AWS SDK only,
-  no other additions.
+  doctest is test-only. Amendment (verified during implementation): the builder image
+  **already** builds aws-sdk-cpp with `BUILD_ONLY="lambda;dynamodb;kms"` — the CLAUDE.md
+  dependency table claiming "Lambda client only" was stale. T5.1 therefore verifies and
+  documents rather than extending the image; no third-party additions either way.
 - **AD-8: All in-Lambda waiting is bounded by the invocation deadline.** Sleeping in
   a Lambda is billed wall-clock time — tolerable on async workers — but sleeping past
   the function timeout kills the invocation mid-flight and turns one rate-limit into
@@ -963,24 +964,23 @@ storage: a naive claim-at-start would suppress crash recovery and strand users o
 - Cold-start note: workers adopting this construct the DynamoDB client once as a
   warm global (same pattern as the LambdaClient), never per-invoke.
 
-#### T5.1 — Builder image: add the DynamoDB client
+#### T5.1 — Builder image: verify the DynamoDB client and fix stale docs
 
-- **Goal:** Make `Aws::DynamoDB::DynamoDBClient` available to Lambda builds (the image
-  currently builds aws-sdk-cpp with the Lambda client only).
-- **Files:** `docker/lambda-builder/Dockerfile` (extend the aws-sdk-cpp `BUILD_ONLY`
-  list with `dynamodb`), CLAUDE.md dependency table,
+- **Goal:** ~~Add~~ **Verify** `Aws::DynamoDB::DynamoDBClient` availability — implementation
+  discovered the Dockerfile already builds `BUILD_ONLY="lambda;dynamodb;kms"`; the
+  CLAUDE.md dependency table ("Lambda client only") is what's wrong. Prove linkability
+  with a build-smoke fixture and correct the docs.
+- **Files:** CLAUDE.md dependency table (correct the aws-sdk-cpp row),
   `tests/local/discord/fixtures/build-smoke-dynamodb/main.cpp` (minimal `main()`
   constructing a value-initialized client config + `DynamoDBClient`; test fixture
-  only, never deployed).
-- **Test specification / acceptance (RED = fixture fails to build before the
-  Dockerfile change):** `scripts/build-lambda.sh tests/local/discord/fixtures/build-smoke-dynamodb`
-  fails on the current image, succeeds after; an existing Lambda
-  (`src/lambdas/discord-interactions`) still builds; note image rebuild time impact in
-  the commit body.
-- **Depends on:** nothing — but **not parallel-safe with other builders**: this task
-  rebuilds the shared Docker builder image tag while every other Wave-1 task runs
-  `scripts/test-unit.sh` against it. Run it solo at the start or end of Wave 1 (see
-  §6 rules).
+  only, never deployed). No Dockerfile change.
+- **Test specification / acceptance:**
+  `scripts/build-lambda.sh tests/local/discord/fixtures/build-smoke-dynamodb`
+  (with `LAMBDA_SKIP_IMAGE_BUILD=1` against the prebuilt image) succeeds and produces
+  a zip; an existing Lambda (`src/lambdas/discord-interactions`) still builds.
+- **Depends on:** nothing. With no image rebuild, the former Wave-1 image-tag race is
+  moot; still avoid running two Docker builds concurrently on one host for cache
+  coherence.
 
 #### T5.2 — Durable idempotency primitives (`idempotency_store.hpp`)
 
