@@ -42,11 +42,7 @@ the whole surface.
   gets a response. Claim-at-start (`claim_interaction`) is an explicit opt-in for
   non-idempotent side effects only.
 
-The design decisions behind these contracts (AD-1 … AD-9) and the task-by-task
-rationale live in
-[`docs/plans/tdd-framework-improvement-plan.md`](plans/tdd-framework-improvement-plan.md).
-Everything below documents what actually shipped; where the plan and the source
-disagree, the source wins.
+Everything below documents what actually shipped; the source is authoritative.
 
 All functions and types are in `namespace discord_interactions`. `json` is an alias
 for `nlohmann::json`.
