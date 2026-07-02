@@ -222,7 +222,7 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 1. Verifies Docker is available and the RIE image can run on `linux/arm64`.
 2. Starts `tests/local/discord/mock_lambda_server.py` on port `19001`.
 3. Extracts each zip from `packaged-lambdas/` into a temp directory and mounts it as `/var/runtime` inside an RIE container.
-4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing.
+4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing, REST layer (`rest`).
 5. Tears everything down and prints `All local Discord Lambda tests passed.` on success.
 
 **All zips must be built before running tests.** Build them all first:
@@ -230,12 +230,34 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 scripts/build-all-lambdas.sh
 ```
 
+### Fixture Lambdas (built on demand)
+
+Test-only fixture Lambdas live under `tests/local/discord/fixtures/<name>/`.
+They are never deployed and are deliberately **not** part of
+`scripts/build-all-lambdas.sh`. Suites that need one call
+`ensure_fixture_zip(fixture_dir)` in `run_local_tests.py` first, which builds
+`packaged-lambdas/<name>.zip` via `scripts/build-lambda.sh` (inheriting
+`LAMBDA_ARCH` / `LAMBDA_SKIP_IMAGE_BUILD` / `LAMBDA_BUILDER_IMAGE`) only when
+the zip is missing or older than the fixture sources.
+
+The `rest` suite uses `tests/local/discord/fixtures/discord-cmd-test-echo/`, a
+worker that PATCHes `@original` via `discord_request` with the **default**
+retry policy (async workers may sleep-retry per AD-8; `patch_original_response`
+stays `no_retry` for the sync gateway paths), then creates and deletes a
+followup via `webhook_messages.hpp`. Pointed at the mock server with
+`DISCORD_API_BASE_URL`, it proves the T2.1 retry loop (429-then-200 sequence →
+two recorded attempts) and the T2.2 followup/delete paths against live HTTP.
+
 ### Mock server API
 
 The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:
 
-- `POST /__reset` — reset logs and configure canned responses: `{"responses": {"function-name": <payload>}}`
+- `POST /__reset` — reset all logs and configure canned behavior:
+  - `{"responses": {"function-name": <payload>}}` — canned Lambda invocation responses
+  - `{"discord_sequences": {"<METHOD> <path-suffix>": [{"status": 429, "body": {"retry_after": 0.05}}, {"status": 200, "body": {}}]}}` — canned per-path Discord response sequences; a request matches on equal method + path suffix, each request consumes the next entry, and the last entry repeats when exhausted. Unmatched Discord-API requests answer `200 {}`.
 - `GET /__logs` — retrieve the list of recorded invocations: `[{function_name, invocation_type, payload}]`
+- `GET /__discord_requests` — every Discord-API-shaped request (any method on `/api/v<N>/...`), in order: `[{method, path, body}]`
+- `GET /__discord_patches` — legacy log of `PATCH .../messages/@original` requests: `[{application_id, interaction_token, payload}]` (kept for pre-T2.3 suites; superseded by `__discord_requests`)
 - `POST /2015-03-31/functions/<name>/invocations` — Lambda-style invocation endpoint
 
 ---

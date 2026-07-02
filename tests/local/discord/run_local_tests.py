@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
 from discord_modules import route_map, validate_module_manifests  # noqa: E402
 
 PACKAGED_DIR = REPO_ROOT / "packaged-lambdas"
+FIXTURES_DIR = REPO_ROOT / "tests" / "local" / "discord" / "fixtures"
 MOCK_SERVER = REPO_ROOT / "tests" / "local" / "discord" / "mock_lambda_server.py"
 MOCK_PORT = 19001
 LAMBDA_PLATFORM = os.environ.get("DISCORD_TEST_PLATFORM", "linux/arm64")
@@ -71,11 +72,14 @@ def assert_not_in(needle, haystack, message):
         raise TestFailure(f"{message}: unexpected {needle!r} in {haystack!r}")
 
 
-def reset_mock(responses=None):
+def reset_mock(responses=None, discord_sequences=None):
     http_json(
         "POST",
         f"http://127.0.0.1:{MOCK_PORT}/__reset",
-        {"responses": responses or {}},
+        {
+            "responses": responses or {},
+            "discord_sequences": discord_sequences or {},
+        },
     )
 
 
@@ -87,6 +91,51 @@ def get_logs():
 def get_discord_patches():
     _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__discord_patches")
     return payload
+
+
+def get_discord_requests():
+    _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__discord_requests")
+    return payload
+
+
+def ensure_fixture_zip(fixture_dir):
+    """Build a test-only fixture Lambda zip on demand and return its zip name.
+
+    Fixture Lambdas under tests/local/discord/fixtures/ are never deployed and
+    are deliberately NOT part of scripts/build-all-lambdas.sh — the suites that
+    need them call this helper first (the T2.3 mechanism T5.3 reuses). The zip
+    is rebuilt via scripts/build-lambda.sh (a subprocess inheriting the
+    caller's LAMBDA_ARCH / LAMBDA_SKIP_IMAGE_BUILD / LAMBDA_BUILDER_IMAGE env)
+    only when packaged-lambdas/<name>.zip is missing or older than any file in
+    the fixture folder.
+    """
+    fixture_dir = Path(fixture_dir)
+    if not fixture_dir.is_dir():
+        raise TestFailure(f"fixture folder does not exist: {fixture_dir}")
+
+    zip_name = f"{fixture_dir.name}.zip"
+    zip_path = PACKAGED_DIR / zip_name
+    source_mtime = max(
+        (path.stat().st_mtime for path in fixture_dir.rglob("*") if path.is_file()),
+        default=0.0,
+    )
+    if zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+        return zip_name
+
+    print(f"Building fixture Lambda {fixture_dir.name} (zip missing or stale)...")
+    try:
+        run([str(REPO_ROOT / "scripts" / "build-lambda.sh"), str(fixture_dir)])
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        stdout = (exc.stdout or b"").decode("utf-8", errors="replace").strip()
+        details = "\n".join(part for part in (stdout[-2000:], stderr[-2000:]) if part)
+        raise TestFailure(
+            f"fixture build failed for {fixture_dir}:\n{details}"
+        ) from exc
+
+    if not zip_path.exists():
+        raise TestFailure(f"fixture build produced no zip: {zip_path}")
+    return zip_name
 
 
 def extract_package(zip_name, destination):
@@ -770,6 +819,107 @@ def run_autocomplete_tests():
         assert_in("no focused option", text, "autocomplete missing focused option error")
 
 
+def run_rest_tests():
+    # T2.3: integration coverage for the REST layer (rest.hpp / T2.1 +
+    # webhook_messages.hpp / T2.2) against the live mock Discord server. The
+    # discord-cmd-test-echo fixture PATCHes @original via discord_request with
+    # the DEFAULT retry policy (async workers may sleep-retry per AD-8 —
+    # patch_original_response's no_retry contract is for the sync gateway
+    # paths), then creates and deletes a followup via webhook_messages.hpp.
+    zip_name = ensure_fixture_zip(FIXTURES_DIR / "discord-cmd-test-echo")
+
+    application_id = "test-app"
+    token = "test-token"
+    webhook_path = f"/api/v10/webhooks/{application_id}/{token}"
+    followup_id = "9001"
+
+    reset_mock(
+        discord_sequences={
+            # One 429 (retry_after 0.05s) then success: discord_request's retry
+            # loop must consume the 429, sleep, and re-attempt.
+            "PATCH /messages/@original": [
+                {"status": 429, "body": {"retry_after": 0.05}},
+                {"status": 200, "body": {}},
+            ],
+            # The followup POST must return a message id for the DELETE step.
+            f"POST {webhook_path}": [{"status": 200, "body": {"id": followup_id}}],
+        }
+    )
+
+    env = {
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_SESSION_TOKEN": "test",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        # rest.hpp's discord_api_base_url() honors this override, pointing the
+        # fixture's Discord REST traffic at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
+    }
+    with LambdaContainer(zip_name, env) as container:
+        interaction = {
+            "type": 2,
+            "application_id": application_id,
+            "token": token,
+            "data": {"name": "test", "options": [{"type": 1, "name": "echo"}]},
+        }
+        status, text = container.invoke(interaction)
+        assert_equal(status, 200, "rest fixture HTTP status")
+        assert_equal(
+            parse_json(text, "rest fixture success")["ok"],
+            True,
+            "rest fixture success payload",
+        )
+
+        requests = get_discord_requests()
+        original_path = f"{webhook_path}/messages/@original"
+
+        # (1) Retry proof: TWO PATCH attempts recorded — the 429 was consumed
+        # and the retry landed the 200.
+        patches = [r for r in requests if r["method"] == "PATCH"]
+        assert_equal(len(patches), 2, "rest PATCH attempt count (429 then 200)")
+        for index, request in enumerate(patches):
+            assert_equal(request["path"], original_path, f"rest PATCH #{index + 1} path")
+
+        # (2) Followup POST and its DELETE recorded with the correct paths.
+        posts = [r for r in requests if r["method"] == "POST"]
+        assert_equal(len(posts), 1, "rest followup POST count")
+        assert_equal(posts[0]["path"], webhook_path, "rest followup POST path")
+        assert_equal(
+            posts[0]["body"].get("flags"), 64, "rest followup POST ephemeral flags"
+        )
+
+        deletes = [r for r in requests if r["method"] == "DELETE"]
+        assert_equal(len(deletes), 1, "rest followup DELETE count")
+        assert_equal(
+            deletes[0]["path"],
+            f"{webhook_path}/messages/{followup_id}",
+            "rest followup DELETE path",
+        )
+
+        # Lifecycle order: both PATCH attempts, then the POST, then the DELETE.
+        assert_equal(
+            [r["method"] for r in requests],
+            ["PATCH", "PATCH", "POST", "DELETE"],
+            "rest request order",
+        )
+
+        # Back-compat: the legacy __discord_patches log still records @original
+        # PATCHes with the same shape older suites rely on.
+        legacy_patches = get_discord_patches()
+        assert_equal(len(legacy_patches), 2, "rest legacy patch log count")
+        assert_equal(
+            legacy_patches[0]["application_id"],
+            application_id,
+            "rest legacy patch log application_id",
+        )
+        assert_equal(
+            legacy_patches[0]["interaction_token"],
+            token,
+            "rest legacy patch log token",
+        )
+
+
 def assert_before(text, earlier, later, message):
     earlier_index = text.find(earlier)
     later_index = text.find(later)
@@ -1205,6 +1355,7 @@ def main():
             "component",
             "modal",
             "autocomplete",
+            "rest",
             "nitrado-responses",
         ],
         help="Run only the named suite. Pass multiple times to run several suites.",
@@ -1217,10 +1368,11 @@ def main():
         "component",
         "modal",
         "autocomplete",
+        "rest",
         "nitrado-responses",
     ]
 
-    docker_suites = {"ingress", "application", "component", "modal", "autocomplete"}
+    docker_suites = {"ingress", "application", "component", "modal", "autocomplete", "rest"}
     mock_server = None
     if any(suite in docker_suites for suite in suites):
         docker_preflight()
@@ -1245,6 +1397,8 @@ def main():
                 run_modal_tests()
             elif suite == "autocomplete":
                 run_autocomplete_tests()
+            elif suite == "rest":
+                run_rest_tests()
             elif suite == "nitrado-responses":
                 run_nitrado_command_response_tests()
     finally:
