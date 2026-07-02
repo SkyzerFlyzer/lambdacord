@@ -412,7 +412,12 @@ def run_application_command_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
-        "DISCORD_COMMAND_ROUTES": json.dumps(route_map(REPO_ROOT, "commands")),
+        # Installed-module routes plus a fixed test entry so the route-map
+        # override path stays testable on a clean framework checkout (no
+        # modules installed).
+        "DISCORD_COMMAND_ROUTES": json.dumps(
+            {**route_map(REPO_ROOT, "commands"), "ping": "discord-cmd-example-ping"}
+        ),
     }
     with LambdaContainer("discord-application-command-handler.zip", env) as container:
         payload = {
@@ -646,6 +651,9 @@ def assert_before(text, earlier, later, message):
 
 
 def run_nitrado_command_response_tests():
+    if not (REPO_ROOT / "modules" / "nitrado").is_dir():
+        print("SKIP: nitrado-responses suite (modules/nitrado is not installed)")
+        return
     validate_module_manifests(REPO_ROOT)
 
     sign_in_source = (
