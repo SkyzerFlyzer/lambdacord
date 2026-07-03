@@ -5,8 +5,9 @@ Correctness is proven in layers, fastest first.
 ## Fast C++ unit tests (doctest)
 
 `scripts/test-unit.sh` compiles `tests/unit/cpp/*.cpp` against `src/include`
-inside the builder image (host arch, no zip packaging, no emulator) and runs
-the doctest suite; the exit code propagates.
+inside the builder image (arm64 by default, like the builds — set
+`LAMBDA_ARCH=x86_64` to run natively on an x86_64 host; no zip packaging, no
+RIE) and runs the doctest suite; the exit code propagates.
 
 ```bash
 scripts/test-unit.sh                       # run all C++ unit tests
