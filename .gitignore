@@ -12,3 +12,6 @@ modules/
 *.tfvars
 infra/terraform/generated_*.tf
 infra/terraform/moved.tf
+
+# Claude Code session machinery (subagent worktrees, local settings)
+.claude/

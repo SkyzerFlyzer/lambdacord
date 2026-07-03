@@ -4,10 +4,14 @@
 #include <aws/lambda/model/InvocationType.h>
 #include <aws/lambda/model/InvokeRequest.h>
 #include <aws/lambda-runtime/runtime.h>
+#include <discord_interactions/json_access.hpp>
+#include <discord_interactions/lambda_client.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +30,15 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Thrown when the derived autocomplete worker Lambda does not exist
+// (ResourceNotFoundException). On the sync autocomplete path this is not an
+// error to surface: the handler answers with an empty choices result so Discord
+// simply shows no suggestions (no PATCH — autocomplete is on the 3s budget).
+class unknown_route_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
     const char* region = std::getenv("AWS_REGION");
     config.region = region == nullptr ? "us-east-1" : region;
@@ -40,24 +53,32 @@ void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
     }
 }
 
+// All interaction-JSON field reads below go through the throw-free accessors
+// in discord_interactions/json_access.hpp: nlohmann's value(key, default)
+// throws on a present-but-wrong-typed key, and this router must degrade a
+// malformed payload to a validation error, never crash on a type_error.
 void append_selected_path(const json& options, std::ostringstream& full_name) {
     if (!options.is_array()) {
         return;
     }
 
     for (const auto& option : options) {
-        const int type = option.value("type", 0);
+        const int type = discord_interactions::get_if<int>(option, "type").value_or(0);
         if (type != 1 && type != 2) {
             continue;
         }
 
-        const std::string name = option.value("name", "");
+        const std::string name =
+            discord_interactions::get_if<std::string>(option, "name").value_or("");
         if (name.empty()) {
             return;
         }
 
         full_name << ' ' << name;
-        append_selected_path(option.value("options", json::array()), full_name);
+        const json* inner = discord_interactions::get_array_if(option, "options");
+        if (inner != nullptr) {
+            append_selected_path(*inner, full_name);
+        }
         return;
     }
 }
@@ -68,16 +89,18 @@ bool append_focused_option(const json& options, std::ostringstream& output) {
     }
 
     for (const auto& option : options) {
-        const int type = option.value("type", 0);
-        const std::string name = option.value("name", "");
+        const int type = discord_interactions::get_if<int>(option, "type").value_or(0);
+        const std::string name =
+            discord_interactions::get_if<std::string>(option, "name").value_or("");
         if (type == 1 || type == 2) {
-            if (append_focused_option(option.value("options", json::array()), output)) {
+            const json* inner = discord_interactions::get_array_if(option, "options");
+            if (inner != nullptr && append_focused_option(*inner, output)) {
                 return true;
             }
             continue;
         }
 
-        if (option.value("focused", false)) {
+        if (discord_interactions::get_if<bool>(option, "focused").value_or(false)) {
             output << name;
             return true;
         }
@@ -89,8 +112,11 @@ bool append_focused_option(const json& options, std::ostringstream& output) {
 std::string autocomplete_function_name(const json& interaction) {
     const json& data = interaction.at("data");
     std::ostringstream base_name{};
-    base_name << data.value("name", "");
-    append_selected_path(data.value("options", json::array()), base_name);
+    base_name << discord_interactions::get_if<std::string>(data, "name").value_or("");
+    const json* top_options = discord_interactions::get_array_if(data, "options");
+    if (top_options != nullptr) {
+        append_selected_path(*top_options, base_name);
+    }
 
     if (base_name.str().empty()) {
         throw validation_error("autocomplete interaction is missing an application command name");
@@ -103,7 +129,7 @@ std::string autocomplete_function_name(const json& interaction) {
                    [](char ch) { return ch == ' ' ? '-' : ch; });
 
     std::ostringstream focused{};
-    if (!append_focused_option(data.value("options", json::array()), focused)) {
+    if (top_options == nullptr || !append_focused_option(*top_options, focused)) {
         throw validation_error("autocomplete interaction has no focused option");
     }
 
@@ -125,14 +151,23 @@ json invoke_sync(const std::string& function_name, const json& payload) {
     auto outcome = g_lambda_client->Invoke(request);
 
     if (!outcome.IsSuccess()) {
+        const auto& error = outcome.GetError();
+        if (discord_interactions::is_function_not_found(error)) {
+            throw unknown_route_error("no worker Lambda for route " + function_name +
+                                      ": " + error.GetMessage());
+        }
         throw std::runtime_error(
-            "failed to invoke " + function_name + ": " +
-            outcome.GetError().GetMessage());
+            "failed to invoke " + function_name + ": " + error.GetMessage());
     }
 
     std::ostringstream response_payload{};
     response_payload << outcome.GetResult().GetPayload().rdbuf();
     return json::parse(response_payload.str());
+}
+
+// {type:8, data:{choices:[]}} — an autocomplete result with no suggestions.
+json empty_autocomplete_response() {
+    return json{{"type", 8}, {"data", {{"choices", json::array()}}}};
 }
 
 invocation_response handler(const invocation_request& request) {
@@ -141,6 +176,10 @@ invocation_response handler(const invocation_request& request) {
         const json response =
             invoke_sync(autocomplete_function_name(interaction), interaction);
         return invocation_response::success(response.dump(), "application/json");
+    } catch (const unknown_route_error& ex) {
+        std::cerr << "autocomplete handler unknown route: " << ex.what() << "\n";
+        return invocation_response::success(empty_autocomplete_response().dump(),
+                                            "application/json");
     } catch (const validation_error& ex) {
         std::cerr << "autocomplete handler validation failed: " << ex.what() << "\n";
         return invocation_response::failure(ex.what(), "application/json");

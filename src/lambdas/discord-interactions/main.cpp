@@ -4,6 +4,8 @@
 #include <aws/lambda/model/InvocationType.h>
 #include <aws/lambda/model/InvokeRequest.h>
 #include <aws/lambda-runtime/runtime.h>
+#include <discord_interactions/interaction.hpp>
+#include <discord_interactions/json_access.hpp>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
@@ -66,11 +68,17 @@ bool verify_signature(const std::string& public_key_hex,
     std::array<unsigned char, crypto_sign_PUBLICKEYBYTES> public_key{};
     std::array<unsigned char, crypto_sign_BYTES> signature{};
 
+    // cppcheck's experimental bug hunting cannot prove that value-initialized
+    // std::array storage and std::string::c_str() buffers are initialized at
+    // these C-API boundaries; both are guaranteed by the language. Suppressed
+    // inline so the pre-commit checks stay meaningful for real findings.
+    // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
     if (sodium_hex2bin(public_key.data(), public_key.size(), public_key_hex.c_str(),
                        public_key_hex.size(), nullptr, nullptr, nullptr) != 0) {
         return false;
     }
 
+    // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
     if (sodium_hex2bin(signature.data(), signature.size(), signature_hex.c_str(),
                        signature_hex.size(), nullptr, nullptr, nullptr) != 0) {
         return false;
@@ -78,9 +86,12 @@ bool verify_signature(const std::string& public_key_hex,
 
     const std::string signed_message = timestamp + body;
     return crypto_sign_verify_detached(
+               // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
                signature.data(),
+               // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
                reinterpret_cast<const unsigned char*>(signed_message.c_str()),
                signed_message.size(),
+               // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
                public_key.data()) == 0;
 }
 
@@ -110,6 +121,44 @@ void configure_lambda_client(Aws::Client::ClientConfiguration& config) {
         config.scheme = Aws::Http::Scheme::HTTP;
         config.verifySSL = false;
     }
+}
+
+// Manifest-driven ephemeral defer (T3.2, AD-5). The generated Terraform emits
+// the merged, comma-separated allowlist of command paths into the optional
+// DISCORD_EPHEMERAL_DEFER_ROUTES env var; the ingress only parses that env var
+// and never reads manifests at runtime. CHAT_INPUT commands match on the full
+// derived command path ("account link"); context menu commands (data.type 2/3)
+// apply the same allowlist check using the raw command name ("Report User") —
+// the simplest rule consistent with exact-path matching.
+bool ephemeral_defer_requested(const json& interaction) {
+    const char* csv = std::getenv("DISCORD_EPHEMERAL_DEFER_ROUTES");
+    if (csv == nullptr || *csv == '\0') {
+        return false;
+    }
+
+    // A malformed interaction without an object `data` never opts in;
+    // application_command_path requires the `data` key to exist.
+    const auto data = interaction.find("data");
+    if (data == interaction.end() || !data->is_object()) {
+        return false;
+    }
+
+    std::string command_path{};
+    const auto kind = discord_interactions::application_command_kind(interaction);
+    if (kind == discord_interactions::ApplicationCommandKind::chat_input) {
+        command_path = discord_interactions::application_command_path(interaction);
+    } else {
+        // Throw-free read (json_access.hpp): a wrong-typed "name" must fall
+        // back to no-opt-in, not throw into the generic 500 path.
+        command_path =
+            discord_interactions::get_if<std::string>(*data, "name").value_or("");
+    }
+
+    // csv is guarded non-null and non-empty above; bug hunting cannot see
+    // through the getenv contract (same class of false positive as in
+    // verify_signature).
+    // cppcheck-suppress [bughuntingUninit, unmatchedSuppression]
+    return discord_interactions::route_in_csv_allowlist(command_path, csv);
 }
 
 invocation_response make_proxy_response(int status_code, const json& body) {
@@ -187,9 +236,14 @@ invocation_response handler(const invocation_request& request) {
         switch (type) {
         case 1:
             return make_proxy_response(200, json{{"type", 1}});
-        case 2:
+        case 2: {
             invoke_async("discord-application-command-handler", interaction);
-            return make_proxy_response(200, json{{"type", 5}});
+            json ack = json{{"type", 5}};
+            if (ephemeral_defer_requested(interaction)) {
+                ack["data"] = json{{"flags", 64}};
+            }
+            return make_proxy_response(200, ack);
+        }
         case 3:
             invoke_async("discord-message-component-handler", interaction);
             return make_proxy_response(200, json{{"type", 6}});

@@ -5,20 +5,53 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LAMBDA_ARCH="${LAMBDA_ARCH:-arm64}"
 LAMBDA_BUILDER_IMAGE="${LAMBDA_BUILDER_IMAGE:-lambdacord-lambda-builder:${LAMBDA_ARCH}}"
+DIFF_RANGE="${STATIC_CHECKS_DIFF_RANGE:-}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/pre-commit-static-checks.sh [<lambda-dir>...]
+  scripts/pre-commit-static-checks.sh [--diff-range <ref>...<ref>] [<lambda-dir>...]
 
-Without arguments, the script discovers staged files and runs checks for any
-affected Lambda folder that contains a main.cpp entry point.
+Without arguments, the script discovers staged files (git diff --cached) and
+runs checks for any affected Lambda folder that contains a main.cpp entry point.
+
+With --diff-range (or the STATIC_CHECKS_DIFF_RANGE env var), the affected files
+are discovered from `git diff --name-only <range>` instead of the staged index.
+This is how CI analyzes a whole PR on a fresh checkout with an empty index.
+Everything else about tool selection and behavior is identical.
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --diff-range)
+      if [[ $# -lt 2 ]]; then
+        echo "--diff-range requires a <ref>...<ref> argument." >&2
+        exit 1
+      fi
+      DIFF_RANGE="$2"
+      shift 2
+      ;;
+    --diff-range=*)
+      DIFF_RANGE="${1#*=}"
+      shift
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
+  set -- "${POSITIONAL_ARGS[@]}"
+else
+  set --
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -105,12 +138,29 @@ if [[ $# -gt 0 ]]; then
   done
 else
   STAGED_FILES=()
-  while IFS= read -r line; do
-    STAGED_FILES+=("${line}")
-  done < <(git -C "${REPO_ROOT}" diff --cached --name-only --diff-filter=ACMR)
+  if [[ -n "${DIFF_RANGE}" ]]; then
+    while IFS= read -r line; do
+      STAGED_FILES+=("${line}")
+    done < <(git -C "${REPO_ROOT}" diff --name-only --diff-filter=ACMR "${DIFF_RANGE}")
+  else
+    while IFS= read -r line; do
+      STAGED_FILES+=("${line}")
+    done < <(git -C "${REPO_ROOT}" diff --cached --name-only --diff-filter=ACMR)
+  fi
 
   for staged_file in "${STAGED_FILES[@]}"; do
     [[ "${staged_file}" == *.cpp || "${staged_file}" == *.cc || "${staged_file}" == *.cxx || "${staged_file}" == *.hpp || "${staged_file}" == *.hh || "${staged_file}" == *.h ]] || continue
+
+    # Shared framework headers are compiled into every Lambda, and the unit
+    # suite deliberately excludes the curl/AWS-including ones — a change under
+    # src/include therefore affects every Lambda target, not none.
+    if [[ "${staged_file}" == src/include/* ]]; then
+      for target in "${ALL_TARGETS[@]}"; do
+        add_target "${target}"
+      done
+      continue
+    fi
+
     staged_dir="${REPO_ROOT}/$(dirname "${staged_file}")"
 
     for target in "${ALL_TARGETS[@]}"; do

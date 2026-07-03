@@ -7,8 +7,42 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 FUNCTION_PATH = re.compile(r"^/2015-03-31/functions/([^/]+)/invocations$")
+DISCORD_API_PATH = re.compile(r"^/api/v[0-9]+/")
 DISCORD_PATCH_PATH = re.compile(r"^/api/v[0-9]+/webhooks/([^/]+)/([^/]+)/messages/@original$")
-STATE = {"logs": [], "responses": {}, "discord_patches": []}
+STATE = {
+    "logs": [],
+    "responses": {},
+    "discord_patches": [],
+    # Every Discord-API-shaped request (any method under /api/v<N>/), in
+    # order: [{method, path, body}] (T2.3).
+    "discord_requests": [],
+    # Canned per-path response sequences, configured via __reset:
+    #   {"<METHOD> <path-suffix>": [{"status": 429, "body": {...}}, ...]}
+    # Each matching request consumes the next entry; the last entry repeats
+    # when the sequence is exhausted. No match -> 200 {}.
+    "discord_sequences": {},
+    "discord_sequence_positions": {},
+    # Function names the mock treats as nonexistent (T3.4). Invoking one — for
+    # any invocation type — returns Lambda's real ResourceNotFoundException wire
+    # shape (HTTP 404, header x-amzn-ErrorType: ResourceNotFoundException, body
+    # {"Type":"User","message":"Function not found: ..."}) so the AWS SDK
+    # LambdaClient in the routers maps it to LambdaErrors::RESOURCE_NOT_FOUND.
+    # Unlisted unknown functions keep the pre-T3.4 behavior (202 for async,
+    # 404 {"error": ...} for sync) so existing suites are unaffected.
+    "not_found": [],
+    # Minimal in-memory DynamoDB table for the T5.3 dedup suite: items keyed by
+    # their interaction_id "S" value. The DynamoDB JSON protocol is a POST to
+    # "/" with the operation in the X-Amz-Target header
+    # (DynamoDB_20120810.PutItem / DynamoDB_20120810.GetItem), routed before
+    # the Discord/function handlers. Debug-inspectable via GET /__dynamodb_table.
+    "dynamodb_table": {},
+}
+
+DYNAMODB_TARGET_PREFIX = "DynamoDB_20120810."
+CONDITIONAL_CHECK_FAILED = {
+    "__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException",
+    "message": "The conditional request failed",
+}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -28,6 +62,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _write_function_not_found(self, function_name):
+        """Emit Lambda's real ResourceNotFoundException wire shape (T3.4).
+
+        The AWS SDK classifies a service error by the x-amzn-ErrorType response
+        header, mapping "ResourceNotFoundException" to
+        LambdaErrors::RESOURCE_NOT_FOUND. Routers use that to distinguish an
+        unregistered route (friendly reply) from any other invoke failure.
+        """
+        body = {"Type": "User", "message": f"Function not found: {function_name}"}
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("x-amzn-RequestId", "local-test-request")
+        self.send_header("x-amzn-ErrorType", "ResourceNotFoundException")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         if self.path == "/__logs":
             self._write_json(200, STATE["logs"])
@@ -37,22 +89,120 @@ class Handler(BaseHTTPRequestHandler):
             self._write_json(200, STATE["discord_patches"])
             return
 
+        if self.path == "/__discord_requests":
+            self._write_json(200, STATE["discord_requests"])
+            return
+
+        if self.path == "/__dynamodb_table":
+            self._write_json(200, STATE["dynamodb_table"])
+            return
+
+        if self._handle_discord_api("GET"):
+            return
+
         self._write_json(404, {"error": "not found"})
 
-    def _handle_discord_patch(self):
-        patch_match = DISCORD_PATCH_PATH.match(self.path)
-        if patch_match is None:
+    def _sequence_response(self, method):
+        """Next canned (status, body) for `method self.path`, or None.
+
+        Sequence keys are "<METHOD> <path-suffix>"; a request matches when the
+        method is equal and the request path ends with the suffix. Consumption
+        is per-key: each hit advances the position, and the last entry repeats
+        once the sequence is exhausted.
+        """
+        for key, entries in STATE["discord_sequences"].items():
+            configured_method, _, path_suffix = key.partition(" ")
+            if configured_method != method or not path_suffix:
+                continue
+            if not self.path.endswith(path_suffix) or not entries:
+                continue
+            position = STATE["discord_sequence_positions"].get(key, 0)
+            entry = entries[min(position, len(entries) - 1)]
+            STATE["discord_sequence_positions"][key] = position + 1
+            return entry.get("status", 200), entry.get("body", {})
+        return None
+
+    def _handle_discord_api(self, method):
+        """Record + answer any Discord-API-shaped request (path /api/v<N>/...).
+
+        Records {method, path, body} into the __discord_requests log; PATCHes
+        of /messages/@original additionally keep feeding the legacy
+        __discord_patches log so pre-T2.3 suites keep working unchanged.
+        Responds from a configured sequence when one matches, else 200 {}.
+        """
+        if DISCORD_API_PATH.match(self.path) is None:
             return False
 
         payload = self._read_json()
-        STATE["discord_patches"].append(
-            {
-                "application_id": patch_match.group(1),
-                "interaction_token": patch_match.group(2),
-                "payload": payload,
-            }
+        STATE["discord_requests"].append(
+            {"method": method, "path": self.path, "body": payload}
         )
-        self._write_json(200, {"ok": True})
+
+        patch_match = DISCORD_PATCH_PATH.match(self.path)
+        if method == "PATCH" and patch_match is not None:
+            STATE["discord_patches"].append(
+                {
+                    "application_id": patch_match.group(1),
+                    "interaction_token": patch_match.group(2),
+                    "payload": payload,
+                }
+            )
+
+        canned = self._sequence_response(method)
+        if canned is not None:
+            self._write_json(canned[0], canned[1])
+            return True
+
+        self._write_json(200, {})
+        return True
+
+    def _handle_dynamodb(self):
+        """Answer minimal DynamoDB PutItem/GetItem requests (T5.3).
+
+        The DynamoDB JSON protocol posts to "/" and names the operation in the
+        X-Amz-Target header, so this is routed on that header BEFORE the
+        Discord and Lambda-invocation handlers. Items live in an in-memory
+        dict keyed by the interaction_id "S" value. PutItem honors the
+        ConditionExpression "attribute_not_exists(interaction_id)" (the T5.2
+        claim guard) by answering DynamoDB's real ConditionalCheckFailedException
+        shape (400 + __type) when the id already exists; without a condition it
+        overwrites (the completion marker). GetItem answers {"Item": ...} on a
+        hit and {} on a miss, matching the real service.
+        """
+        target = self.headers.get("X-Amz-Target", "")
+        if not target.startswith(DYNAMODB_TARGET_PREFIX):
+            return False
+
+        operation = target[len(DYNAMODB_TARGET_PREFIX):]
+        payload = self._read_json()
+
+        if operation == "PutItem":
+            item = payload.get("Item", {})
+            interaction_id = item.get("interaction_id", {}).get("S", "")
+            condition = payload.get("ConditionExpression", "")
+            if (
+                condition == "attribute_not_exists(interaction_id)"
+                and interaction_id in STATE["dynamodb_table"]
+            ):
+                self._write_json(400, CONDITIONAL_CHECK_FAILED)
+                return True
+            STATE["dynamodb_table"][interaction_id] = item
+            self._write_json(200, {})
+            return True
+
+        if operation == "GetItem":
+            interaction_id = payload.get("Key", {}).get("interaction_id", {}).get("S", "")
+            stored = STATE["dynamodb_table"].get(interaction_id)
+            self._write_json(200, {} if stored is None else {"Item": stored})
+            return True
+
+        self._write_json(
+            400,
+            {
+                "__type": "com.amazon.coral.service#UnknownOperationException",
+                "message": f"unsupported mock DynamoDB operation: {operation}",
+            },
+        )
         return True
 
     def do_POST(self):
@@ -61,10 +211,18 @@ class Handler(BaseHTTPRequestHandler):
             STATE["logs"] = []
             STATE["responses"] = payload.get("responses", {})
             STATE["discord_patches"] = []
+            STATE["discord_requests"] = []
+            STATE["discord_sequences"] = payload.get("discord_sequences", {})
+            STATE["discord_sequence_positions"] = {}
+            STATE["not_found"] = payload.get("not_found", [])
+            STATE["dynamodb_table"] = {}
             self._write_json(200, {"ok": True})
             return
 
-        if self._handle_discord_patch():
+        if self._handle_dynamodb():
+            return
+
+        if self._handle_discord_api("POST"):
             return
 
         match = FUNCTION_PATH.match(self.path)
@@ -83,6 +241,13 @@ class Handler(BaseHTTPRequestHandler):
             }
         )
 
+        # T3.4: a function explicitly configured as nonexistent 404s with the
+        # Lambda ResourceNotFoundException shape regardless of invocation type,
+        # so routers see the SDK's RESOURCE_NOT_FOUND classification.
+        if function_name in STATE["not_found"]:
+            self._write_function_not_found(function_name)
+            return
+
         if function_name in STATE["responses"]:
             self._write_json(200, STATE["responses"][function_name])
             return
@@ -97,7 +262,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_PATCH(self):
-        if self._handle_discord_patch():
+        if self._handle_discord_api("PATCH"):
+            return
+
+        self._write_json(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        if self._handle_discord_api("DELETE"):
             return
 
         self._write_json(404, {"error": "not found"})
@@ -105,7 +276,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19001
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # Bind all interfaces: RIE containers reach this server via the Docker
+    # host-gateway address, which a 127.0.0.1 bind is invisible to on native
+    # Linux (Docker Desktop's NAT masked this).
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.serve_forever()
 
 

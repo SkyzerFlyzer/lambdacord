@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "lib"))
 from discord_modules import route_map, validate_module_manifests  # noqa: E402
 
 PACKAGED_DIR = REPO_ROOT / "packaged-lambdas"
+FIXTURES_DIR = REPO_ROOT / "tests" / "local" / "discord" / "fixtures"
 MOCK_SERVER = REPO_ROOT / "tests" / "local" / "discord" / "mock_lambda_server.py"
 MOCK_PORT = 19001
 LAMBDA_PLATFORM = os.environ.get("DISCORD_TEST_PLATFORM", "linux/arm64")
@@ -71,11 +72,16 @@ def assert_not_in(needle, haystack, message):
         raise TestFailure(f"{message}: unexpected {needle!r} in {haystack!r}")
 
 
-def reset_mock(responses=None):
+def reset_mock(responses=None, discord_sequences=None, not_found=None):
     http_json(
         "POST",
         f"http://127.0.0.1:{MOCK_PORT}/__reset",
-        {"responses": responses or {}},
+        {
+            "responses": responses or {},
+            "discord_sequences": discord_sequences or {},
+            # T3.4: function names the mock should 404 as ResourceNotFound.
+            "not_found": not_found or [],
+        },
     )
 
 
@@ -87,6 +93,68 @@ def get_logs():
 def get_discord_patches():
     _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__discord_patches")
     return payload
+
+
+def get_discord_requests():
+    _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__discord_requests")
+    return payload
+
+
+def get_dynamodb_table():
+    """Current mock DynamoDB items, keyed by interaction_id S value (T5.3)."""
+    _, payload = http_json("GET", f"http://127.0.0.1:{MOCK_PORT}/__dynamodb_table")
+    return payload
+
+
+def ensure_fixture_zip(fixture_dir):
+    """Build a test-only fixture Lambda zip on demand and return its zip name.
+
+    Fixture Lambdas under tests/local/discord/fixtures/ are never deployed and
+    are deliberately NOT part of scripts/build-all-lambdas.sh — the suites that
+    need them call this helper first (the T2.3 mechanism T5.3 reuses). The zip
+    is rebuilt via scripts/build-lambda.sh (a subprocess inheriting the
+    caller's LAMBDA_ARCH / LAMBDA_SKIP_IMAGE_BUILD / LAMBDA_BUILDER_IMAGE env)
+    only when packaged-lambdas/<name>.zip is missing or older than any file in
+    the fixture folder.
+    """
+    fixture_dir = Path(fixture_dir)
+    if not fixture_dir.is_dir():
+        raise TestFailure(f"fixture folder does not exist: {fixture_dir}")
+
+    zip_name = f"{fixture_dir.name}.zip"
+    zip_path = PACKAGED_DIR / zip_name
+    # Fixtures compile against the framework headers under src/include, so a
+    # header edit invalidates a previously built fixture binary just as much as
+    # editing the fixture sources does. Fold the newest src/include mtime into
+    # the staleness comparison, otherwise a header change leaves a stale binary
+    # and a false-green suite locally.
+    include_dir = REPO_ROOT / "src" / "include"
+    source_mtime = max(
+        (
+            path.stat().st_mtime
+            for tree in (fixture_dir, include_dir)
+            for path in tree.rglob("*")
+            if path.is_file()
+        ),
+        default=0.0,
+    )
+    if zip_path.exists() and zip_path.stat().st_mtime >= source_mtime:
+        return zip_name
+
+    print(f"Building fixture Lambda {fixture_dir.name} (zip missing or stale)...")
+    try:
+        run([str(REPO_ROOT / "scripts" / "build-lambda.sh"), str(fixture_dir)])
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        stdout = (exc.stdout or b"").decode("utf-8", errors="replace").strip()
+        details = "\n".join(part for part in (stdout[-2000:], stderr[-2000:]) if part)
+        raise TestFailure(
+            f"fixture build failed for {fixture_dir}:\n{details}"
+        ) from exc
+
+    if not zip_path.exists():
+        raise TestFailure(f"fixture build produced no zip: {zip_path}")
+    return zip_name
 
 
 def extract_package(zip_name, destination):
@@ -112,6 +180,49 @@ def wait_for_lambda(port):
             last_error = exc
             time.sleep(STARTUP_DELAY_SECONDS)
     raise TestFailure(f"lambda runtime did not become ready on port {port}: {last_error}")
+
+
+def wait_for_mock_server(process, timeout=5.0):
+    """Block until the mock control-plane answers, or fail with diagnostics.
+
+    The mock is a plain subprocess with no readiness handshake. A blind sleep
+    hides the common failure where MOCK_PORT is already in use: the process dies
+    immediately and every suite then fails with confusing connection-refused
+    errors far from the real cause. Poll /__logs instead, and on failure surface
+    a clear message plus whatever the process wrote to stderr before dying.
+    """
+    url = f"http://127.0.0.1:{MOCK_PORT}/__logs"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        try:
+            http_json("GET", url)
+            return
+        except Exception:
+            time.sleep(0.1)
+
+    # Never became ready: stop it if it is somehow still alive, then drain the
+    # captured stderr for the failure message.
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+    captured = b""
+    if process.stderr is not None:
+        try:
+            captured = process.stderr.read() or b""
+        except Exception:
+            captured = b""
+
+    details = f"mock server failed to start — is port {MOCK_PORT} in use?"
+    text = captured.decode("utf-8", errors="replace").strip()
+    if text:
+        details += f"\nmock server stderr:\n{text}"
+    raise TestFailure(details)
 
 
 class LambdaContainer:
@@ -147,8 +258,15 @@ class LambdaContainer:
             LAMBDA_PLATFORM,
             "--name",
             self.container_name,
+            # Docker Desktop resolves host.docker.internal natively; native Linux
+            # dockerd needs the host-gateway mapping for containers to reach the
+            # mock server on the host.
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            # Bind only loopback: the harness reaches the RIE over 127.0.0.1, so
+            # there is no reason to publish the container port on every interface.
             "-p",
-            f"{self.port}:8080",
+            f"127.0.0.1:{self.port}:8080",
             "-v",
             f"{self.tempdir}:/var/runtime:ro",
         ]
@@ -336,7 +454,11 @@ def run_ingress_tests():
             status, text = container.invoke(make_ingress_event(key_path, command_body))
             payload = parse_json(text, "ingress application command")
             assert_equal(status, 200, "ingress application command HTTP status")
-            assert_equal(json.loads(payload["body"])["type"], 5, "ingress deferred ack")
+            ack_body = json.loads(payload["body"])
+            assert_equal(ack_body["type"], 5, "ingress deferred ack")
+            # Without DISCORD_EPHEMERAL_DEFER_ROUTES the ack stays the plain
+            # {type:5} — no data/flags payload (T3.2 regression guard).
+            assert_not_in("data", ack_body, "ingress deferred ack without ephemeral env")
             logs = get_logs()
             assert_equal(len(logs), 1, "ingress application command invoke count")
             assert_equal(
@@ -387,6 +509,84 @@ def run_ingress_tests():
             assert_equal(body["type"], 8, "ingress autocomplete body type")
             assert_equal(body["data"]["choices"][0]["value"], "alpha", "ingress autocomplete choice")
 
+        # T3.2: manifest-driven ephemeral deferred ACKs. With the generated
+        # DISCORD_EPHEMERAL_DEFER_ROUTES env var set on the container, a type-2
+        # command whose full path is listed gets {type:5, data:{flags:64}};
+        # unlisted commands keep the plain {type:5}. Context menu commands
+        # (data.type 2/3) match on the raw command name. Component (type 3) and
+        # modal (type 5) ACKs are unchanged.
+        ephemeral_env = dict(positive_env)
+        ephemeral_env["DISCORD_EPHEMERAL_DEFER_ROUTES"] = (
+            "example ping,other cmd,Report User"
+        )
+        with LambdaContainer("discord-interactions.zip", ephemeral_env) as container:
+            reset_mock()
+            listed_body = json.dumps(
+                {
+                    "type": 2,
+                    "data": {
+                        "name": "example",
+                        "options": [{"type": 1, "name": "ping"}],
+                    },
+                }
+            )
+            status, text = container.invoke(make_ingress_event(key_path, listed_body))
+            payload = parse_json(text, "ingress ephemeral defer listed command")
+            assert_equal(status, 200, "ingress ephemeral defer HTTP status")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress ephemeral defer ack type")
+            assert_equal(
+                body.get("data", {}).get("flags"),
+                64,
+                "ingress ephemeral defer ack flags",
+            )
+            logs = get_logs()
+            assert_equal(
+                logs[0]["function_name"],
+                "discord-application-command-handler",
+                "ingress ephemeral defer still routes to the command handler",
+            )
+
+            reset_mock()
+            unlisted_body = json.dumps({"type": 2, "data": {"name": "admin"}})
+            status, text = container.invoke(make_ingress_event(key_path, unlisted_body))
+            payload = parse_json(text, "ingress ephemeral defer unlisted command")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress unlisted command ack type")
+            assert_not_in("data", body, "ingress unlisted command ack stays plain")
+
+            reset_mock()
+            context_menu_body = json.dumps(
+                {"type": 2, "data": {"type": 2, "name": "Report User"}}
+            )
+            status, text = container.invoke(
+                make_ingress_event(key_path, context_menu_body)
+            )
+            payload = parse_json(text, "ingress ephemeral defer context menu")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress context menu ack type")
+            assert_equal(
+                body.get("data", {}).get("flags"),
+                64,
+                "ingress context menu ephemeral defer flags (raw-name match)",
+            )
+
+            reset_mock()
+            component_body = json.dumps({"type": 3, "data": {"custom_id": "pager:1"}})
+            status, text = container.invoke(make_ingress_event(key_path, component_body))
+            payload = parse_json(text, "ingress component with ephemeral env")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 6, "ingress component ack unchanged by env")
+            assert_not_in("data", body, "ingress component ack carries no flags")
+
+            reset_mock()
+            modal_body = json.dumps({"type": 5, "data": {"custom_id": "feedback:1"}})
+            status, text = container.invoke(make_ingress_event(key_path, modal_body))
+            payload = parse_json(text, "ingress modal with ephemeral env")
+            body = json.loads(payload["body"])
+            assert_equal(body["type"], 5, "ingress modal ack unchanged by env")
+            assert_not_in("data", body, "ingress modal ack carries no flags")
+
         negative_env = dict(positive_env)
         negative_env.pop("DISCORD_SKIP_SIGNATURE_VERIFY", None)
         with LambdaContainer("discord-interactions.zip", negative_env) as container:
@@ -407,7 +607,27 @@ def run_application_command_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
-        "DISCORD_COMMAND_ROUTES": json.dumps(route_map(REPO_ROOT, "commands")),
+        # T3.4: the friendly unknown-route PATCH targets @original via
+        # rest.hpp; point that Discord REST traffic at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
+        # Installed-module routes plus a fixed test entry so the route-map
+        # override path stays testable on a clean framework checkout (no
+        # modules installed).
+        "DISCORD_COMMAND_ROUTES": json.dumps(
+            {**route_map(REPO_ROOT, "commands"), "ping": "discord-cmd-example-ping"}
+        ),
+        # Context menu route maps (T3.1): installed-module routes plus a fixed
+        # test entry so the override path stays testable on a clean framework
+        # checkout, mirroring DISCORD_COMMAND_ROUTES above.
+        "DISCORD_USER_COMMAND_ROUTES": json.dumps(
+            {
+                **route_map(REPO_ROOT, "user_commands"),
+                "Block User": "discord-usercmd-example-block",
+            }
+        ),
+        "DISCORD_MESSAGE_COMMAND_ROUTES": json.dumps(
+            route_map(REPO_ROOT, "message_commands")
+        ),
     }
     with LambdaContainer("discord-application-command-handler.zip", env) as container:
         payload = {
@@ -533,10 +753,101 @@ def run_application_command_tests():
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-cmd-example-ping", "example ping route")
 
+        # Context menu commands (T3.1): data.type 2 (user) and 3 (message)
+        # route mechanically to discord-usercmd-<suffix> / discord-msgcmd-<suffix>.
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 2, "name": "Report User"}}
+        )
+        assert_equal(status, 200, "user context menu HTTP status")
+        assert_equal(
+            parse_json(text, "user context menu success")["ok"],
+            True,
+            "user context menu success payload",
+        )
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-usercmd-report-user", "user context menu route")
+        assert_equal(logs[0]["invocation_type"], "Event", "user context menu invocation type")
+
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 3, "name": "Pin Message"}}
+        )
+        assert_equal(status, 200, "message context menu HTTP status")
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-msgcmd-pin-message", "message context menu route")
+        assert_equal(logs[0]["invocation_type"], "Event", "message context menu invocation type")
+
+        # A DISCORD_USER_COMMAND_ROUTES entry (keyed by the raw command name)
+        # wins over mechanical derivation, mirroring DISCORD_COMMAND_ROUTES.
+        reset_mock()
+        status, text = container.invoke(
+            {"type": 2, "data": {"type": 2, "name": "Block User"}}
+        )
+        assert_equal(status, 200, "mapped user context menu HTTP status")
+        logs = get_logs()
+        assert_equal(logs[0]["function_name"], "discord-usercmd-example-block", "mapped user context menu route")
+
+        # T3.4: an unregistered slash command derives discord-cmd-unknown-route,
+        # which the mock 404s as ResourceNotFound. The router PATCHes @original
+        # with the friendly copy (no internal error text) and STILL fails the
+        # invocation for observability.
+        reset_mock(not_found=["discord-cmd-unknown-route"])
+        status, text = container.invoke(
+            {
+                "type": 2,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"name": "unknown-route"},
+            }
+        )
+        assert_equal(status, 200, "unknown route application HTTP status")
+        # The invocation still fails for observability: the RIE returns the
+        # router's failure message as the body (same shape as the missing-name
+        # case above, which asserts on "internal error").
+        assert_in("unknown route", text, "unknown route application invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route application PATCH count")
+        assert_equal(patches[0]["application_id"], "app-unknown", "unknown route application PATCH app id")
+        assert_equal(patches[0]["interaction_token"], "tok-unknown", "unknown route application PATCH token")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route application friendly copy",
+        )
+        # Discord ignores flags on webhook message edits — the PATCH inherits
+        # the visibility of the original deferred ACK, so sending flags would
+        # only mislead readers into thinking the reply is ephemeral.
+        assert_not_in("flags", patches[0]["payload"], "unknown route application PATCH carries no flags")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route application PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route application PATCH leaks no SDK error message")
+
         reset_mock()
         status, text = container.invoke({"type": 2, "data": {}})
         assert_equal(status, 200, "application handler missing name HTTP status")
         assert_in("internal error", text, "application handler missing name error")
+
+    # Malformed route-map env JSON must not turn every interaction into a
+    # failure: the router logs one warning and falls back to mechanical
+    # derivation instead of throwing out of json::parse.
+    reset_mock()
+    broken_env = dict(env)
+    broken_env["DISCORD_COMMAND_ROUTES"] = "not json"
+    with LambdaContainer("discord-application-command-handler.zip", broken_env) as container:
+        status, text = container.invoke({"type": 2, "data": {"name": "ping"}})
+        assert_equal(status, 200, "malformed route map HTTP status")
+        assert_equal(
+            parse_json(text, "malformed route map success")["ok"],
+            True,
+            "malformed route map success payload",
+        )
+        logs = get_logs()
+        assert_equal(
+            logs[0]["function_name"],
+            "discord-cmd-ping",
+            "malformed route map falls back to mechanical route",
+        )
 
 
 def run_message_component_tests():
@@ -548,6 +859,8 @@ def run_message_component_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # T3.4: point the friendly unknown-route PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
         "DISCORD_COMPONENT_ROUTES": json.dumps(route_map(REPO_ROOT, "components")),
     }
     with LambdaContainer("discord-message-component-handler.zip", env) as container:
@@ -556,6 +869,33 @@ def run_message_component_tests():
         assert_equal(parse_json(text, "component handler success")["ok"], True, "component handler success payload")
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-component-pager", "component handler route")
+
+        # T3.4: an unregistered component prefix derives discord-component-unknown,
+        # which the mock 404s as ResourceNotFound. The router PATCHes @original
+        # with the friendly copy and still fails the invocation.
+        reset_mock(not_found=["discord-component-unknown"])
+        status, text = container.invoke(
+            {
+                "type": 3,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"custom_id": "unknown:1"},
+            }
+        )
+        assert_equal(status, 200, "unknown route component HTTP status")
+        assert_in("unknown route", text, "unknown route component invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route component PATCH count")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route component friendly copy",
+        )
+        # Discord ignores flags on webhook message edits (see application suite).
+        assert_not_in("flags", patches[0]["payload"], "unknown route component PATCH carries no flags")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route component PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route component PATCH leaks no SDK error message")
 
         reset_mock()
         status, text = container.invoke({"type": 3, "data": {}})
@@ -572,6 +912,8 @@ def run_modal_tests():
         "AWS_SESSION_TOKEN": "test",
         "AWS_EC2_METADATA_DISABLED": "true",
         "AWS_LAMBDA_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # T3.4: point the friendly unknown-route PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
     }
     with LambdaContainer("discord-modal-handler.zip", env) as container:
         status, text = container.invoke({"type": 5, "data": {"custom_id": "feedback:2"}})
@@ -579,6 +921,33 @@ def run_modal_tests():
         assert_equal(parse_json(text, "modal handler success")["ok"], True, "modal handler success payload")
         logs = get_logs()
         assert_equal(logs[0]["function_name"], "discord-modal-feedback", "modal handler route")
+
+        # T3.4: an unregistered modal prefix derives discord-modal-unknown, which
+        # the mock 404s as ResourceNotFound. The router PATCHes @original with
+        # the friendly copy and still fails the invocation.
+        reset_mock(not_found=["discord-modal-unknown"])
+        status, text = container.invoke(
+            {
+                "type": 5,
+                "application_id": "app-unknown",
+                "token": "tok-unknown",
+                "data": {"custom_id": "unknown:1"},
+            }
+        )
+        assert_equal(status, 200, "unknown route modal HTTP status")
+        assert_in("unknown route", text, "unknown route modal invocation still fails")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "unknown route modal PATCH count")
+        assert_equal(
+            patches[0]["payload"].get("content"),
+            "That command isn't available right now.",
+            "unknown route modal friendly copy",
+        )
+        # Discord ignores flags on webhook message edits (see application suite).
+        assert_not_in("flags", patches[0]["payload"], "unknown route modal PATCH carries no flags")
+        patch_text = json.dumps(patches[0]["payload"])
+        assert_not_in("ResourceNotFound", patch_text, "unknown route modal PATCH leaks no SDK error type")
+        assert_not_in("Function not found", patch_text, "unknown route modal PATCH leaks no SDK error message")
 
         reset_mock()
         status, text = container.invoke({"type": 5, "data": {}})
@@ -630,6 +999,240 @@ def run_autocomplete_tests():
         assert_equal(status, 200, "autocomplete missing focused option HTTP status")
         assert_in("no focused option", text, "autocomplete missing focused option error")
 
+        # T3.4: when the derived autocomplete worker does not exist, the sync
+        # router must NOT PATCH (it is on Discord's 3s budget); it returns an
+        # empty choices result so Discord shows no suggestions instead of
+        # "application did not respond".
+        reset_mock(not_found=["discord-autocomplete-admin-ban-user"])
+        status, text = container.invoke(payload)
+        assert_equal(status, 200, "unknown route autocomplete HTTP status")
+        response = parse_json(text, "unknown route autocomplete response")
+        assert_equal(response["type"], 8, "unknown route autocomplete body type")
+        assert_equal(response["data"]["choices"], [], "unknown route autocomplete empty choices")
+        assert_equal(
+            get_discord_requests(), [], "unknown route autocomplete performs no Discord request"
+        )
+
+
+def run_rest_tests():
+    # T2.3: integration coverage for the REST layer (rest.hpp / T2.1 +
+    # webhook_messages.hpp / T2.2) against the live mock Discord server. The
+    # discord-cmd-test-echo fixture PATCHes @original via discord_request with
+    # the DEFAULT retry policy (async workers may sleep-retry per AD-8 —
+    # patch_original_response's no_retry contract is for the sync gateway
+    # paths), then creates and deletes a followup via webhook_messages.hpp.
+    zip_name = ensure_fixture_zip(FIXTURES_DIR / "discord-cmd-test-echo")
+
+    application_id = "test-app"
+    token = "test-token"
+    webhook_path = f"/api/v10/webhooks/{application_id}/{token}"
+    followup_id = "9001"
+
+    reset_mock(
+        discord_sequences={
+            # One 429 (retry_after 0.05s) then success: discord_request's retry
+            # loop must consume the 429, sleep, and re-attempt.
+            "PATCH /messages/@original": [
+                {"status": 429, "body": {"retry_after": 0.05}},
+                {"status": 200, "body": {}},
+            ],
+            # The followup POST must return a message id for the DELETE step.
+            f"POST {webhook_path}": [{"status": 200, "body": {"id": followup_id}}],
+        }
+    )
+
+    env = {
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_SESSION_TOKEN": "test",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        # rest.hpp's discord_api_base_url() honors this override, pointing the
+        # fixture's Discord REST traffic at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
+    }
+    with LambdaContainer(zip_name, env) as container:
+        interaction = {
+            "type": 2,
+            "application_id": application_id,
+            "token": token,
+            "data": {"name": "test", "options": [{"type": 1, "name": "echo"}]},
+        }
+        status, text = container.invoke(interaction)
+        assert_equal(status, 200, "rest fixture HTTP status")
+        assert_equal(
+            parse_json(text, "rest fixture success")["ok"],
+            True,
+            "rest fixture success payload",
+        )
+
+        requests = get_discord_requests()
+        original_path = f"{webhook_path}/messages/@original"
+
+        # (1) Retry proof: TWO PATCH attempts recorded — the 429 was consumed
+        # and the retry landed the 200.
+        patches = [r for r in requests if r["method"] == "PATCH"]
+        assert_equal(len(patches), 2, "rest PATCH attempt count (429 then 200)")
+        for index, request in enumerate(patches):
+            assert_equal(request["path"], original_path, f"rest PATCH #{index + 1} path")
+
+        # (2) Followup POST and its DELETE recorded with the correct paths.
+        posts = [r for r in requests if r["method"] == "POST"]
+        assert_equal(len(posts), 1, "rest followup POST count")
+        assert_equal(posts[0]["path"], webhook_path, "rest followup POST path")
+        assert_equal(
+            posts[0]["body"].get("flags"), 64, "rest followup POST ephemeral flags"
+        )
+
+        deletes = [r for r in requests if r["method"] == "DELETE"]
+        assert_equal(len(deletes), 1, "rest followup DELETE count")
+        assert_equal(
+            deletes[0]["path"],
+            f"{webhook_path}/messages/{followup_id}",
+            "rest followup DELETE path",
+        )
+
+        # Lifecycle order: both PATCH attempts, then the POST, then the DELETE.
+        assert_equal(
+            [r["method"] for r in requests],
+            ["PATCH", "PATCH", "POST", "DELETE"],
+            "rest request order",
+        )
+
+        # Back-compat: the legacy __discord_patches log still records @original
+        # PATCHes with the same shape older suites rely on.
+        legacy_patches = get_discord_patches()
+        assert_equal(len(legacy_patches), 2, "rest legacy patch log count")
+        assert_equal(
+            legacy_patches[0]["application_id"],
+            application_id,
+            "rest legacy patch log application_id",
+        )
+        assert_equal(
+            legacy_patches[0]["interaction_token"],
+            token,
+            "rest legacy patch log token",
+        )
+
+
+def run_dedup_tests():
+    # T5.3: integration coverage for the durable completion-marker dedup
+    # (idempotency_store.hpp / T5.2, AD-9). The discord-cmd-test-dedup fixture
+    # runs the check -> act -> PATCH -> record flow against the mock server's
+    # minimal DynamoDB surface (PutItem/GetItem routed on the X-Amz-Target
+    # header), pointed there via AWS_DYNAMODB_ENDPOINT. The crash-recovery case
+    # is the point of AD-9: a claim-at-start implementation fails it.
+    zip_name = ensure_fixture_zip(FIXTURES_DIR / "discord-cmd-test-dedup")
+
+    application_id = "test-app"
+    token = "test-token"
+
+    def interaction(interaction_id, fail_before_patch=False):
+        payload = {
+            "type": 2,
+            "id": interaction_id,
+            "application_id": application_id,
+            "token": token,
+            "data": {"name": "test", "options": [{"type": 1, "name": "dedup"}]},
+        }
+        if fail_before_patch:
+            # Test-only crash simulation flag, read from the interaction JSON
+            # (payload-field approach — see the fixture's header comment).
+            payload["test_fail_before_patch"] = True
+        return payload
+
+    env = {
+        "AWS_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_SESSION_TOKEN": "test",
+        "AWS_EC2_METADATA_DISABLED": "true",
+        # Opt in to the durable dedup and point its warm DynamoDB client at
+        # the mock server (mirrors the AWS_LAMBDA_ENDPOINT pattern).
+        "DISCORD_IDEMPOTENCY_TABLE": "test-idempotency",
+        "AWS_DYNAMODB_ENDPOINT": f"http://host.docker.internal:{MOCK_PORT}",
+        # rest.hpp's discord_api_base_url() honors this override, pointing the
+        # fixture's @original PATCH at the mock server.
+        "DISCORD_API_BASE_URL": f"http://host.docker.internal:{MOCK_PORT}/api/v10",
+    }
+    with LambdaContainer(zip_name, env) as container:
+        # (1) Duplicate success: the same interaction id invoked twice PATCHes
+        # exactly once — the second run sees the completion record and skips.
+        reset_mock()
+        status, text = container.invoke(interaction("dedup-dup-1"))
+        assert_equal(status, 200, "dedup first invoke HTTP status")
+        first = parse_json(text, "dedup first invoke")
+        assert_equal(first.get("ok"), True, "dedup first invoke ok")
+        assert_not_in("skipped", first, "dedup first invoke is not skipped")
+
+        status, text = container.invoke(interaction("dedup-dup-1"))
+        assert_equal(status, 200, "dedup duplicate invoke HTTP status")
+        second = parse_json(text, "dedup duplicate invoke")
+        assert_equal(second.get("ok"), True, "dedup duplicate invoke ok")
+        assert_equal(second.get("skipped"), True, "dedup duplicate invoke skipped")
+
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "dedup duplicate success PATCH count")
+        assert_equal(
+            patches[0]["application_id"], application_id, "dedup PATCH application id"
+        )
+        assert_equal(patches[0]["interaction_token"], token, "dedup PATCH token")
+        table = get_dynamodb_table()
+        assert_in("dedup-dup-1", table, "dedup completion record stored")
+
+        # (2) Crash recovery (the AD-9 case): a run that fails BEFORE the PATCH
+        # records nothing, so the retry re-runs and the user gets a response.
+        # A claim-at-start implementation records the claim before crashing and
+        # suppresses the retry — failing this test is the point of it.
+        reset_mock()
+        status, text = container.invoke(
+            interaction("dedup-crash-1", fail_before_patch=True)
+        )
+        assert_equal(status, 200, "dedup crash invoke HTTP status")
+        assert_in("simulated crash", text, "dedup crash invoke fails the invocation")
+        assert_equal(get_discord_patches(), [], "dedup crash invoke performs no PATCH")
+        assert_not_in(
+            "dedup-crash-1", get_dynamodb_table(), "dedup crash invoke records nothing"
+        )
+
+        status, text = container.invoke(interaction("dedup-crash-1"))
+        assert_equal(status, 200, "dedup retry invoke HTTP status")
+        retry = parse_json(text, "dedup retry invoke")
+        assert_equal(retry.get("ok"), True, "dedup retry invoke ok")
+        assert_not_in("skipped", retry, "dedup retry re-runs instead of skipping")
+        patches = get_discord_patches()
+        assert_equal(len(patches), 1, "dedup crash retry PATCH count")
+        assert_in("dedup-crash-1", get_dynamodb_table(), "dedup retry records completion")
+
+        # (3) Two distinct interaction ids are independent: two PATCHes.
+        reset_mock()
+        for interaction_id in ("dedup-distinct-1", "dedup-distinct-2"):
+            status, text = container.invoke(interaction(interaction_id))
+            assert_equal(status, 200, f"dedup {interaction_id} HTTP status")
+            assert_equal(
+                parse_json(text, f"dedup {interaction_id}").get("ok"),
+                True,
+                f"dedup {interaction_id} ok",
+            )
+        assert_equal(len(get_discord_patches()), 2, "dedup distinct ids PATCH count")
+
+    # (4) Opt-out: without DISCORD_IDEMPOTENCY_TABLE every primitive no-ops to
+    # "proceed", so the same id PATCHes twice.
+    optout_env = dict(env)
+    optout_env.pop("DISCORD_IDEMPOTENCY_TABLE")
+    with LambdaContainer(zip_name, optout_env) as container:
+        reset_mock()
+        for attempt in (1, 2):
+            status, text = container.invoke(interaction("dedup-optout-1"))
+            assert_equal(status, 200, f"dedup opt-out invoke #{attempt} HTTP status")
+            result = parse_json(text, f"dedup opt-out invoke #{attempt}")
+            assert_equal(result.get("ok"), True, f"dedup opt-out invoke #{attempt} ok")
+            assert_not_in(
+                "skipped", result, f"dedup opt-out invoke #{attempt} never skips"
+            )
+        assert_equal(len(get_discord_patches()), 2, "dedup opt-out PATCH count")
+        assert_equal(get_dynamodb_table(), {}, "dedup opt-out stores nothing")
+
 
 def assert_before(text, earlier, later, message):
     earlier_index = text.find(earlier)
@@ -641,6 +1244,9 @@ def assert_before(text, earlier, later, message):
 
 
 def run_nitrado_command_response_tests():
+    if not (REPO_ROOT / "modules" / "nitrado").is_dir():
+        print("SKIP: nitrado-responses suite (modules/nitrado is not installed)")
+        return
     validate_module_manifests(REPO_ROOT)
 
     sign_in_source = (
@@ -1063,6 +1669,8 @@ def main():
             "component",
             "modal",
             "autocomplete",
+            "rest",
+            "dedup",
             "nitrado-responses",
         ],
         help="Run only the named suite. Pass multiple times to run several suites.",
@@ -1075,23 +1683,36 @@ def main():
         "component",
         "modal",
         "autocomplete",
+        "rest",
+        "dedup",
         "nitrado-responses",
     ]
 
-    docker_suites = {"ingress", "application", "component", "modal", "autocomplete"}
+    docker_suites = {
+        "ingress",
+        "application",
+        "component",
+        "modal",
+        "autocomplete",
+        "rest",
+        "dedup",
+    }
     mock_server = None
     if any(suite in docker_suites for suite in suites):
         docker_preflight()
+        # Capture stderr to a pipe (not DEVNULL) so a failed start — most often
+        # "port already in use" — can be reported. log_message is silenced in
+        # the mock, so stderr only carries real errors and never fills the pipe
+        # during a normal run.
         mock_server = subprocess.Popen(
             [sys.executable, str(MOCK_SERVER), str(MOCK_PORT)],
             cwd=REPO_ROOT,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        wait_for_mock_server(mock_server)
 
     try:
-        if mock_server is not None:
-            time.sleep(0.5)
         for suite in suites:
             if suite == "ingress":
                 run_ingress_tests()
@@ -1103,6 +1724,10 @@ def main():
                 run_modal_tests()
             elif suite == "autocomplete":
                 run_autocomplete_tests()
+            elif suite == "rest":
+                run_rest_tests()
+            elif suite == "dedup":
+                run_dedup_tests()
             elif suite == "nitrado-responses":
                 run_nitrado_command_response_tests()
     finally:

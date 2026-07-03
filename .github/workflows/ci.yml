@@ -1,0 +1,140 @@
+name: CI
+
+# Fast test layers + static checks on every push and pull request.
+#
+# Note: scripts/test-local-discord-lambdas.sh is not invoked directly here
+# because its default linux/arm64 RIE run needs slow, flaky QEMU emulation on
+# the x86_64 GitHub-hosted runners. The static-checks job does exercise the same
+# integration harness (run_local_tests.py under valgrind), but only when a change
+# touches a Discord Lambda, and it forces the native linux/amd64 platform so no
+# arm64 emulation is involved. See CLAUDE.md "Local Testing".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per ref: a new push to a branch (or PR) cancels the
+# previous run instead of double-spending runners on the heavy Docker jobs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # C++ unit tests (doctest). Compiles tests/unit/cpp against src/include inside
+  # the Amazon Linux 2023 builder image, on the runner's native x86_64 arch.
+  cpp-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the builder image once, for x86_64, with a GitHub Actions layer
+      # cache so the aws-lambda-cpp / aws-sdk-cpp compile is reused across runs.
+      # --load makes the image available to the local Docker daemon so the test
+      # script can reuse it via LAMBDA_SKIP_IMAGE_BUILD=1.
+      - name: Build builder image (x86_64, cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lambda-builder/Dockerfile
+          platforms: linux/amd64
+          tags: lambdacord-lambda-builder:x86_64
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run C++ unit tests
+        run: LAMBDA_ARCH=x86_64 LAMBDA_SKIP_IMAGE_BUILD=1 scripts/test-unit.sh
+
+  # Python unit tests (pytest) for scripts/lib helpers.
+  python-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run Python unit tests
+        run: python3 -m pytest tests/unit/python -q
+
+  # Static analysis / pre-commit checks, run against the PR/push diff range.
+  #
+  # The pre-commit hook selects targets from the staged index, which is empty on
+  # a fresh CI checkout. We pass --diff-range so the script analyzes the files
+  # the change actually touched. For any affected Discord Lambda this script
+  # builds the gateway zips in Docker and runs the RIE integration harness under
+  # valgrind, so this job needs the builder image (like cpp-unit) and runs on
+  # x86_64 natively (linux/amd64) to avoid QEMU arm64 emulation.
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the diff range can reach the merge base / previous
+          # commit; the default shallow checkout only has HEAD.
+          fetch-depth: 0
+
+      # Same cached builder image as cpp-unit; --load + LAMBDA_SKIP_IMAGE_BUILD=1
+      # lets the script reuse it instead of rebuilding.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build builder image (x86_64, cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/lambda-builder/Dockerfile
+          platforms: linux/amd64
+          tags: lambdacord-lambda-builder:x86_64
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Compute diff range
+        id: range
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            range="origin/${{ github.base_ref }}...HEAD"
+          else
+            before="${{ github.event.before }}"
+            # github.event.before is unusable when it is the all-zeros SHA (first
+            # push of a new branch) or points at a commit that no longer exists
+            # after a force push (rewritten/orphaned history). git rev-parse
+            # verifies it actually resolves before we hand it to `git diff`; an
+            # unreachable base would otherwise make the static-checks job fatal.
+            if [[ "${before}" =~ ^0+$ ]] || ! git rev-parse -q --verify "${before}^{commit}" >/dev/null 2>&1; then
+              if git rev-parse -q --verify "origin/main^{commit}" >/dev/null 2>&1; then
+                range="origin/main...HEAD"
+              elif git rev-parse -q --verify "HEAD~1^{commit}" >/dev/null 2>&1; then
+                range="HEAD~1...HEAD"
+              else
+                # Root commit with no origin/main: diff against the empty tree so
+                # every file in the initial commit is still analyzed.
+                empty_tree="$(git hash-object -t tree /dev/null)"
+                range="${empty_tree}..HEAD"
+              fi
+            else
+              range="${before}...HEAD"
+            fi
+          fi
+          echo "range=${range}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run static checks
+        run: |
+          LAMBDA_ARCH=x86_64 \
+          LAMBDA_SKIP_IMAGE_BUILD=1 \
+          DISCORD_TEST_PLATFORM=linux/amd64 \
+          scripts/pre-commit-static-checks.sh --diff-range "${{ steps.range.outputs.range }}"

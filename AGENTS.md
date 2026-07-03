@@ -6,6 +6,12 @@ This repo builds AWS Lambda functions in C++ targeting `provided.al2023` (arm64 
 
 Module-specific instructions live in each module's own `AGENTS.md` and `CLAUDE.md`. Read those before changing module code.
 
+The per-header API reference for the framework (`src/include/discord_interactions/`)
+lives in [`docs/framework-reference.md`](docs/framework-reference.md): one section per
+public header with condensed signatures and a usage example, plus the architecture
+contract (headers compiled into each Lambda, custom_id as the only free state channel,
+the AD-8 deadline rule, and the AD-9 completion-marker default).
+
 ---
 
 ## Build System
@@ -41,7 +47,7 @@ Output zips land in `packaged-lambdas/<lambda-name>.zip`. The `.gitignore` exclu
 | Library | Source |
 |---|---|
 | `aws-lambda-cpp` | Built from source (awslabs/aws-lambda-cpp) |
-| `aws-sdk-cpp` (Lambda client only) | Built from source |
+| `aws-sdk-cpp` (Lambda, DynamoDB, and KMS clients) | Built from source with `BUILD_ONLY="lambda;dynamodb;kms"` |
 | `libsodium` | Amazon Linux 2023 DNF |
 | `libcurl` | Amazon Linux 2023 DNF |
 | `nlohmann/json` | Fetched via CMake `FetchContent` at build time |
@@ -57,9 +63,12 @@ User-facing entrypoints are documented in `README.md`. Agent/helper scripts are:
 | Script | Intended use |
 |---|---|
 | `scripts/build-lambda-in-docker.sh` | Internal build implementation called by `scripts/build-lambda.sh` inside the builder container. Do not ask users to call it directly. |
+| `scripts/test-unit.sh` | Compiles and runs the C++ doctest unit suite (`tests/unit/cpp/`) against `src/include` inside the builder image on the host arch. No zip packaging, no RIE. Honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, `LAMBDA_SKIP_IMAGE_BUILD`. Optional `--filter <doctest-filter>`. |
+| `scripts/test-unit-in-docker.sh` | Internal build+run implementation for the C++ unit suite, called by `scripts/test-unit.sh` inside the builder container. Do not ask users to call it directly. |
 | `scripts/lib/discord_modules.py` | Shared Python helper for module manifest discovery, route merging, schema merging, and validation. Import from user-facing scripts instead of duplicating manifest parsing. |
 | `scripts/generate-terraform-modules.py` | Generates root Terraform module calls, pass-through variables, manifest locals, and module output proxies from installed module manifests. Run after adding/removing module Terraform. |
-| `scripts/pre-commit-static-checks.sh` | Hook/agent static-analysis runner. Users may run it manually, but the README points them at `scripts/install-git-hooks.sh` first. |
+| `scripts/new-lambda.py` | Scaffolding generator (documented for users in `README.md`). Creates a module command/component/modal/autocomplete `main.cpp` from AGENTS.md-compliant template strings, wires the `module.manifest.json` route (sorted keys), appends a `discord.commands.json` schema stub for command kinds, and refuses if the route exists. Reuses `scripts/lib/discord_modules.py` for manifest parsing (AD-6); templates live inside the script (no template dir). Takes `--modules-root` for tests. |
+| `scripts/pre-commit-static-checks.sh` | Hook/agent static-analysis runner. Users may run it manually, but the README points them at `scripts/install-git-hooks.sh` first. Selects affected Lambda folders from the staged index by default; pass `--diff-range <ref>...<ref>` (or set `STATIC_CHECKS_DIFF_RANGE`) to select from `git diff --name-only <range>` instead — this is how CI analyzes a whole PR on a fresh checkout with an empty index. The flag only swaps the file-selection source; tool selection and behavior are otherwise identical. |
 | `scripts/mock-lambda-runtime-api.py` | Local/debug helper for Lambda runtime experiments, not part of the normal deploy flow. |
 | `tests/local/discord/run_local_tests.py` | Test harness behind `scripts/test-local-discord-lambdas.sh`; call it directly only when selecting suites during development. |
 | `tests/local/discord/mock_lambda_server.py` | Local Lambda control-plane mock used by the test harness. |
@@ -104,6 +113,46 @@ changing module code.
 
 **Naming convention is load-bearing:** the application-command handler derives the Lambda name mechanically from the command path (`<group> <subcommand>` → `discord-cmd-<group>-<subcommand>`). The name must match exactly.
 
+**Route-map overrides are supported:** a manifest route may point at a non-mechanical target Lambda name (via the object route form or the router env route maps). `check_route_consistency` treats a target that matches the mechanical derivation as load-bearing (its folder must exist — error if missing), and a target that differs as a supported override (a warning to ensure it is deployed and IAM-granted, not an error). This applies symmetrically to `commands`, `user_commands`, `message_commands`, `autocomplete`, `components`, and `modals`. Terraform grants the routers `lambda:InvokeFunction` on every manifest route target (mechanical or override), so an override name still resolves at runtime.
+
+Context menu commands (interaction `data.type` 2 = user, 3 = message) follow the same mechanical rule on the raw command name: ASCII letters lowercased, spaces → `-` (`"Report User"` → `discord-usercmd-report-user`; message commands → `discord-msgcmd-<name>`). Module manifests declare them under the `user_commands` / `message_commands` route kinds; the handler consults the optional `DISCORD_USER_COMMAND_ROUTES` / `DISCORD_MESSAGE_COMMAND_ROUTES` env route maps (JSON objects keyed by the raw command name, mirroring `DISCORD_COMMAND_ROUTES`) before falling back to the mechanical derivation.
+
+### Ephemeral deferred ACKs (`ephemeral_defer`, T3.2 / AD-5)
+
+A manifest command route value may take either form:
+
+```json
+"routes": {
+  "commands": {
+    "account list": "discord-cmd-account-list",
+    "account link": { "lambda": "discord-cmd-account-link", "ephemeral_defer": true }
+  }
+}
+```
+
+The plain-string form means `ephemeral_defer: false`. The object form requires a
+non-empty string `"lambda"`; `"ephemeral_defer"` must be a boolean and is legal
+on `commands`, `user_commands`, and `message_commands` routes — validation
+rejects it on every other route kind (components, modals, autocomplete). Slash
+commands opt in by their full command path; context menu commands opt in by
+their raw command name (the key the ingress matches a type-2/3 interaction
+against). Both `discord_interactions::route_from_manifest_entry` (`routing.hpp`) and the
+Python route parsing (`scripts/lib/discord_modules.py`) accept both forms.
+
+`scripts/generate-terraform-modules.py` merges the opted-in command paths across
+all installed modules (sorted, deduplicated) and emits them as the
+`discord_ephemeral_defer_routes` local in `generated_modules.tf`; the root
+`infra/terraform/main.tf` wires that local into the ingress Lambda's
+`DISCORD_EPHEMERAL_DEFER_ROUTES` env var (omitted entirely when the list is
+empty). The ingress only parses the env var — it never reads manifests at
+runtime. On a type-2 interaction whose command path is listed it responds
+`{"type":5,"data":{"flags":64}}` instead of the plain `{"type":5}`; component
+(type 3) and modal (type 5) ACKs are unchanged. Context menu commands apply the
+same allowlist check using the raw command name (e.g. `Report User`) — the
+simplest rule consistent with exact full-path matching, since context menus
+have no derived path. Rerun the generator after changing any `ephemeral_defer`
+flag.
+
 ---
 
 ## Interaction Routing
@@ -113,7 +162,9 @@ Discord HTTP POST
   └─► discord-interactions          (verify sig, dispatch by type)
         ├─ type 1 (PING)            → respond {type:1} inline
         ├─ type 2 (APPLICATION_CMD) → async ► discord-application-command-handler
-        │                                         └─► discord-cmd-<path>
+        │                                         ├─ data.type 1/absent (slash)   ─► discord-cmd-<path>
+        │                                         ├─ data.type 2 (user ctx menu)  ─► discord-usercmd-<name>
+        │                                         └─ data.type 3 (msg ctx menu)   ─► discord-msgcmd-<name>
         ├─ type 3 (MESSAGE_COMP)    → async ► discord-message-component-handler
         │                                         └─► discord-component-<prefix>
         ├─ type 4 (AUTOCOMPLETE)    → sync  ► discord-autocomplete-handler
@@ -135,6 +186,28 @@ Never return a Discord interaction response payload from an async command,
 component, or modal worker Lambda and expect Discord to show it. If the user
 should see it, PATCH `@original`.
 
+### Unknown-route handling (T3.4)
+
+When a router resolves a worker Lambda name that does not exist, the AWS SDK
+`Invoke` fails with `ResourceNotFoundException`
+(`discord_interactions::is_function_not_found`, `lambda_client.hpp`). Rather
+than let the user hang on "thinking…"/"application did not respond", the
+routers reply cleanly:
+
+- The three **async** routers (application-command, message-component, modal)
+  PATCH `@original` with the shared copy
+  `discord_interactions::unknown_route_user_copy`
+  (`unknown_route.hpp`; `{"content": ...}`) via `rest.hpp`'s
+  `discord_request` with `no_retry` (latency-sensitive path, AD-8), log the real
+  SDK error to stderr, then **still return a failed invocation** for
+  observability. The reply is posted with the visibility of the original
+  deferred ACK — Discord ignores `flags` on webhook message edits, so the PATCH
+  carries none and ephemerality is fixed by the ACK, not this copy. The friendly copy never contains the internal error text. Every
+  other invoke failure keeps the prior behavior (log + generic failure).
+- The **sync** autocomplete router does not PATCH (it is on Discord's 3-second
+  budget); it returns an empty result `{"type":8,"data":{"choices":[]}}` so
+  Discord simply shows no suggestions.
+
 ---
 
 ## Environment Variables
@@ -147,6 +220,7 @@ should see it, PATCH `@original`.
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (used in local tests to point at the mock server) |
 | `DISCORD_SKIP_SIGNATURE_VERIFY` | No | Set to `1` to bypass signature verification (local testing only) |
+| `DISCORD_EPHEMERAL_DEFER_ROUTES` | No | Generated comma-separated allowlist of command paths whose type-2 deferred ACK is ephemeral (`{"type":5,"data":{"flags":64}}`). Emitted into generated Terraform by `scripts/generate-terraform-modules.py` from manifest `ephemeral_defer` flags — never hand-maintained. Entries are whitespace-trimmed and matched exactly against the full command path (`account` never matches `account link`); context menu commands are matched against the raw command name. Unset or empty ⇒ every command defers with the plain `{"type":5}`. |
 
 ### Handler/router Lambdas
 
@@ -154,6 +228,24 @@ should see it, PATCH `@original`.
 |---|---|---|
 | `AWS_REGION` | Yes | Region for the AWS SDK Lambda client |
 | `AWS_LAMBDA_ENDPOINT` | No | Override Lambda endpoint (local testing) |
+| `DISCORD_IDEMPOTENCY_TABLE` | No | DynamoDB table name for durable cross-container interaction dedup (Phase 5 / AD-9). Unset or empty ⇒ both `idempotency_store.hpp` primitives no-op to "proceed". Opt-in per worker Lambda; provision the table via the root `discord_idempotency_table_enabled` Terraform variable. |
+| `AWS_DYNAMODB_ENDPOINT` | No | Override DynamoDB endpoint for the `idempotency_store.hpp` warm-global client (local testing — mirrors `AWS_LAMBDA_ENDPOINT`; the `dedup` suite points it at the mock server) |
+
+### Router route-map overrides
+
+Each router derives its worker Lambda name mechanically (see the routing diagram
+below). Optionally, an env var holding a JSON object can override that derivation
+per key; when unset, empty, or missing the key, the router falls back to the
+mechanical name. These are how the framework wires generated per-module route maps
+into the routers. The **modal** and **autocomplete** routers have no such override —
+they always derive mechanically.
+
+| Variable | Router | Key | Description |
+|---|---|---|---|
+| `DISCORD_COMMAND_ROUTES` | application-command | full command path (`account link`) | JSON object mapping a slash-command path to its worker Lambda; falls back to `discord-cmd-<path>`. |
+| `DISCORD_USER_COMMAND_ROUTES` | application-command | raw command name (`Report User`) | JSON object mapping a user context-menu command name to its worker Lambda; falls back to `discord-usercmd-<name>`. |
+| `DISCORD_MESSAGE_COMMAND_ROUTES` | application-command | raw command name | JSON object mapping a message context-menu command name to its worker Lambda; falls back to `discord-msgcmd-<name>`. |
+| `DISCORD_COMPONENT_ROUTES` | message-component | component `custom_id` prefix (text before the first `:`) | JSON object mapping a component prefix to its worker Lambda; falls back to `discord-component-<prefix>`. |
 
 ### Discord REST helpers
 
@@ -166,6 +258,10 @@ should see it, PATCH `@original`.
 
 ## Local Testing
 
+Fast C++ unit tests: `scripts/test-unit.sh` compiles `tests/unit/cpp/*.cpp` against `src/include` inside the builder image (host arch, no zip, no RIE) and runs the doctest suite; exit code propagates. Add a test file by dropping `tests/unit/cpp/test_<name>.cpp` — the CMake `file(GLOB ...)` picks it up with no CMakeLists edit. Filter with `scripts/test-unit.sh --filter '<doctest-filter>'`. It honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, and `LAMBDA_SKIP_IMAGE_BUILD` exactly like `scripts/build-lambda.sh`.
+
+Fast Python unit tests (no Docker): `python3 -m pytest tests/unit/python` runs the Python unit layer for `scripts/lib`.
+
 Tests require Docker and Python 3. They spin up real Lambda containers via the AWS Lambda Runtime Interface Emulator (RIE) and a lightweight Python mock server that stands in for the Lambda control plane.
 
 ```bash
@@ -176,7 +272,7 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 1. Verifies Docker is available and the RIE image can run on `linux/arm64`.
 2. Starts `tests/local/discord/mock_lambda_server.py` on port `19001`.
 3. Extracts each zip from `packaged-lambdas/` into a temp directory and mounts it as `/var/runtime` inside an RIE container.
-4. Runs test suites: ingress, application-command routing, component routing, modal routing, autocomplete routing.
+4. Runs test suites: `ingress`, `application` (application-command routing), `component` (component routing), `modal` (modal routing), `autocomplete` (autocomplete routing), `rest` (REST layer), `dedup` (durable interaction dedup), and `nitrado-responses`. Select a subset with one or more `--suite <name>` flags. The `nitrado-responses` suite is module-specific and self-skips (prints `SKIP`) when `modules/nitrado` is not installed; it is the only suite that runs without the Docker/RIE control-plane mock.
 5. Tears everything down and prints `All local Discord Lambda tests passed.` on success.
 
 **All zips must be built before running tests.** Build them all first:
@@ -184,13 +280,58 @@ This calls `tests/local/discord/run_local_tests.py`, which:
 scripts/build-all-lambdas.sh
 ```
 
+### Fixture Lambdas (built on demand)
+
+Test-only fixture Lambdas live under `tests/local/discord/fixtures/<name>/`.
+They are never deployed and are deliberately **not** part of
+`scripts/build-all-lambdas.sh`. Suites that need one call
+`ensure_fixture_zip(fixture_dir)` in `run_local_tests.py` first, which builds
+`packaged-lambdas/<name>.zip` via `scripts/build-lambda.sh` (inheriting
+`LAMBDA_ARCH` / `LAMBDA_SKIP_IMAGE_BUILD` / `LAMBDA_BUILDER_IMAGE`) only when
+the zip is missing or older than the fixture sources.
+
+The `rest` suite uses `tests/local/discord/fixtures/discord-cmd-test-echo/`, a
+worker that PATCHes `@original` via `discord_request` with the **default**
+retry policy (async workers may sleep-retry per AD-8; `patch_original_response`
+stays `no_retry` for the sync gateway paths), then creates and deletes a
+followup via `webhook_messages.hpp`. Pointed at the mock server with
+`DISCORD_API_BASE_URL`, it proves the T2.1 retry loop (429-then-200 sequence →
+two recorded attempts) and the T2.2 followup/delete paths against live HTTP.
+
+The `dedup` suite uses `tests/local/discord/fixtures/discord-cmd-test-dedup/`,
+a worker running the AD-9 completion-marker flow (`was_completed` → PATCH →
+`record_completion` from `idempotency_store.hpp`) with a warm-global
+`DynamoDBClient` pointed at the mock server via `AWS_DYNAMODB_ENDPOINT` and
+opted in via `DISCORD_IDEMPOTENCY_TABLE`. It proves that a duplicate delivery
+of a success PATCHes exactly once (second run returns `skipped:true`), that a
+run crashing **before** the PATCH records nothing so the retry re-runs and the
+user still gets a response (the case a claim-at-start design fails), that
+distinct interaction ids stay independent, and that unsetting
+`DISCORD_IDEMPOTENCY_TABLE` opts the whole feature out. The crash is simulated
+with a test-only `test_fail_before_patch` field in the interaction payload
+(payload, not env, so one warm container serves both the crash and the retry).
+
+`tests/local/discord/fixtures/build-smoke-dynamodb/` is a manual/one-shot
+compile-and-link proof that a worker can link the DynamoDB SDK client — it is
+**not** wired into any suite or into CI. The `dedup` suite's
+`discord-cmd-test-dedup` fixture supersedes it: that fixture builds a
+DynamoDB-linked worker (and exercises it end-to-end) on every run, so
+`build-smoke-dynamodb` is only useful for a standalone linkage check and can be
+ignored in the normal test flow.
+
 ### Mock server API
 
 The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:
 
-- `POST /__reset` — reset logs and configure canned responses: `{"responses": {"function-name": <payload>}}`
+- `POST /__reset` — reset all logs and configure canned behavior:
+  - `{"responses": {"function-name": <payload>}}` — canned Lambda invocation responses
+  - `{"discord_sequences": {"<METHOD> <path-suffix>": [{"status": 429, "body": {"retry_after": 0.05}}, {"status": 200, "body": {}}]}}` — canned per-path Discord response sequences; a request matches on equal method + path suffix, each request consumes the next entry, and the last entry repeats when exhausted. Unmatched Discord-API requests answer `200 {}`.
 - `GET /__logs` — retrieve the list of recorded invocations: `[{function_name, invocation_type, payload}]`
+- `GET /__discord_requests` — every Discord-API-shaped request (any method on `/api/v<N>/...`), in order: `[{method, path, body}]`
+- `GET /__discord_patches` — legacy log of `PATCH .../messages/@original` requests: `[{application_id, interaction_token, payload}]` (kept for pre-T2.3 suites; superseded by `__discord_requests`)
 - `POST /2015-03-31/functions/<name>/invocations` — Lambda-style invocation endpoint
+- `POST /` with header `X-Amz-Target: DynamoDB_20120810.<Op>` — minimal DynamoDB surface (T5.3): `PutItem` (honors `ConditionExpression` `attribute_not_exists(interaction_id)` → `400` with the real `ConditionalCheckFailedException` `__type` shape when the id exists; unconditional puts overwrite) and `GetItem` (`{"Item": ...}` or `{}`) against a single in-memory table keyed by the `interaction_id` `S` value. `__reset` clears the table.
+- `GET /__dynamodb_table` — debug view of the current mock DynamoDB items, keyed by interaction id
 
 ---
 
@@ -237,4 +378,57 @@ focused on the framework contract.
 - Downstream worker Lambdas must PATCH deferred Discord responses; Lambda
   return values are not user-visible in the async routing path.
 - Never pass raw internal exception text, upstream API bodies, AWS SDK errors, provider errors, or `ex.what()` directly to Discord users or browser-facing pages. Log internal details to stderr/CloudWatch, then map expected validation cases through module-owned structured error mappings or another explicit allowlist. For infrastructure, Discord API, external API, storage, JSON parsing, or curl failures, send a short friendly retry/action message instead.
+- Workers must branch on `ModuleError.category` before treating a caught error as deterministic: only the deterministic categories (`validation`, `auth`) warrant a friendly PATCH plus a success return, while the transient categories (`upstream`, `storage`, `configuration`, `rate_limited`, `internal` — e.g. `patch_original_response` throwing `ErrorCategory::upstream` on a 429/5xx blip) must return a Lambda failure so AWS async retry re-runs instead of burning the interaction on a permanent "Something went wrong".
 - Validate user-controlled Discord command options before calling storage/API helpers. In particular, parse numeric IDs at the command boundary and return friendly validation copy instead of relying on helper exceptions such as `std::stoll`.
+
+### Interaction idempotency
+
+AWS async invocation is at-least-once and retries failed runs, so a worker
+Lambda can receive the same interaction twice. `CompletedInteractions`
+(`src/include/discord_interactions/idempotency.hpp`) is an in-process guard
+against re-doing work that already completed on the same warm container. Per
+AD-9 it is a **completion marker, not a claim**: `was_completed` is a const,
+side-effect-free check, and `mark_completed` records an id with true LRU
+eviction (re-marking an id refreshes its recency).
+
+- Usage contract — **check → act → PATCH → mark**:
+  1. `if (completed.was_completed(id)) return;` — skip already-finished work.
+  2. Do the work and PATCH `@original` — the user-visible effect.
+  3. `completed.mark_completed(id);` — **only after** the PATCH succeeded.
+- Never `mark_completed` before the user-visible effect has happened. Marking
+  first means a crash before the PATCH leaves the user stuck on "thinking…"
+  because the retry would see the marker and skip it. Marking only after
+  success makes duplicates of a success skip while retries of a crash correctly
+  re-run.
+- Scope honestly: this catches duplicates on the **same warm container** only;
+  retries minutes later often land on a cold container with an empty guard.
+  Durable cross-container dedup is the Phase 5 DynamoDB primitives. Do not wire
+  this into router Lambdas — workers own the decision.
+
+Durable (cross-container) dedup lives in
+`src/include/discord_interactions/idempotency_store.hpp` (with pure request
+shaping split into `idempotency_requests.hpp`). It is DynamoDB-backed and
+gated on `DISCORD_IDEMPOTENCY_TABLE`: an empty table name makes every primitive
+a no-op that returns "proceed", and any DynamoDB/infra error is **fail-open**
+(logged to stderr, then proceed) — a duplicate PATCH beats a silently dropped
+interaction. Two primitives, per AD-9:
+
+- **Completion marker (DEFAULT):** `was_completed(client, table, id)` (GetItem)
+  → act → PATCH → `record_completion(client, table, id, now_epoch_s)`
+  (unconditional PutItem, **only after** the PATCH). A retry of a run that
+  crashed before the PATCH finds no record and re-runs, so the user always gets
+  a response; duplicates of a success skip. Use this unless a side effect must
+  not repeat.
+- **Claim (OPT-IN):** `claim_interaction(client, table, id, now_epoch_s)`
+  (conditional PutItem `attribute_not_exists(interaction_id)`) **before** acting;
+  returns `false` only on `ConditionalCheckFailedException`. Guarantees
+  at-most-once, but a crash after the claim suppresses the retry and the user may
+  get **no** response. Reserve it for non-idempotent side effects (currency,
+  purchases, irreversible external commands) where a dropped response is the
+  lesser evil.
+
+Construct the `Aws::DynamoDB::DynamoDBClient` **once as a warm global** in
+`main()` (same pattern as `lambda_client.hpp`), never per invocation; point it at
+`AWS_DYNAMODB_ENDPOINT` for local testing. TTL defaults to 3600 s (interaction
+tokens expire at 15 min; 1 h leaves audit slack), and the `expires_at` attribute
+lets DynamoDB expire records automatically.
