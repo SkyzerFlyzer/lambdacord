@@ -520,6 +520,105 @@ class TestComponentModalConsistency:
 
 
 # ---------------------------------------------------------------------------
+# FIX 1: map-less routers (modal, autocomplete) have NO env route-map override,
+# so a non-mechanical target on those kinds is dead config -> ERROR, not warning.
+# ---------------------------------------------------------------------------
+
+
+class TestMaplessRouterOverridePolicy:
+    def test_modal_mechanical_target_present_passes(self, repo_root, make_module):
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=["lambdas/modals/discord-modal-feedback"],
+                routes={"modals": {"feedback": "discord-modal-feedback"}},
+            ),
+            lambda_mains=["lambdas/modals/discord-modal-feedback"],
+        )
+        result = run_check(repo_root)
+        assert result["errors"] == []
+        assert result["warnings"] == []
+
+    def test_modal_non_mechanical_target_is_error(self, repo_root, make_module):
+        # The modal router derives discord-modal-<prefix> mechanically with no
+        # route-map override, so a differing target can never be invoked.
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=["lambdas/modals/discord-modal-shared"],
+                routes={"modals": {"feedback": "discord-modal-shared"}},
+            ),
+            lambda_mains=["lambdas/modals/discord-modal-shared"],
+        )
+        result = run_check(repo_root)
+        assert result["warnings"] == []
+        assert any(
+            "discord-modal-shared" in m and "no route-map override" in m
+            for m in result["errors"]
+        )
+
+    def test_autocomplete_mechanical_target_present_passes(
+        self, repo_root, make_module
+    ):
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=[
+                    "lambdas/commands/discord-cmd-weather",
+                    "lambdas/autocomplete/discord-autocomplete-weather-city",
+                ],
+                routes={
+                    "commands": {"weather": "discord-cmd-weather"},
+                    "autocomplete": {
+                        "weather city": "discord-autocomplete-weather-city"
+                    },
+                },
+            ),
+            commands=_weather_autocomplete_schema(),
+            lambda_mains=[
+                "lambdas/commands/discord-cmd-weather",
+                "lambdas/autocomplete/discord-autocomplete-weather-city",
+            ],
+        )
+        result = run_check(repo_root)
+        assert result["errors"] == []
+        assert result["warnings"] == []
+
+    def test_autocomplete_non_mechanical_target_is_error(
+        self, repo_root, make_module
+    ):
+        # The autocomplete router derives discord-autocomplete-<path>-<option>
+        # mechanically with no route-map override -> a differing target is dead
+        # config and must be an ERROR, not a warning.
+        make_module(
+            "demo",
+            base_manifest(
+                lambdas=[
+                    "lambdas/commands/discord-cmd-weather",
+                    "lambdas/autocomplete/discord-autocomplete-shared",
+                ],
+                routes={
+                    "commands": {"weather": "discord-cmd-weather"},
+                    "autocomplete": {
+                        "weather city": "discord-autocomplete-shared"
+                    },
+                },
+            ),
+            commands=_weather_autocomplete_schema(),
+            lambda_mains=[
+                "lambdas/commands/discord-cmd-weather",
+                "lambdas/autocomplete/discord-autocomplete-shared",
+            ],
+        )
+        result = run_check(repo_root)
+        assert result["warnings"] == []
+        assert any(
+            "discord-autocomplete-shared" in m and "no route-map override" in m
+            for m in result["errors"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # Wiring into validate_module_manifests
 # ---------------------------------------------------------------------------
 

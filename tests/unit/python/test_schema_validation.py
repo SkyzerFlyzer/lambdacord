@@ -476,6 +476,135 @@ class TestAutocompleteChoicesExclusive:
         assert problems_for([cmd]) == ""
 
 
+class TestAutocompleteOptionType:
+    # FIX 2: "autocomplete": true is only legal on STRING(3)/INTEGER(4)/NUMBER(10),
+    # and must be rejected on other types even when no choices are present.
+    def _cmd(self, otype):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": otype, "name": "o", "description": "d", "autocomplete": True}
+            ],
+        }
+
+    def test_accepts_autocomplete_on_integer_option(self):
+        assert problems_for([self._cmd(4)]) == ""
+
+    def test_rejects_autocomplete_on_boolean_option(self):
+        msg = problems_for([self._cmd(5)])
+        assert "autocomplete is only valid on STRING, INTEGER, or NUMBER" in msg
+
+
+class TestChoicesOnlyOnChoiceTypes:
+    # FIX 3: static choices are only legal on STRING(3)/INTEGER(4)/NUMBER(10);
+    # a BOOLEAN/USER/etc option carrying choices must be rejected.
+    def _cmd(self, otype):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {
+                    "type": otype,
+                    "name": "o",
+                    "description": "d",
+                    "choices": [{"name": "n", "value": "v"}],
+                }
+            ],
+        }
+
+    def test_accepts_choices_on_string_option(self):
+        assert problems_for([self._cmd(3)]) == ""
+
+    def test_rejects_choices_on_user_option(self):
+        msg = problems_for([self._cmd(6)])
+        assert "choices are only valid on STRING, INTEGER, or NUMBER" in msg
+
+
+class TestSubcommandGroupChildren:
+    # FIX 4: a SUB_COMMAND_GROUP (type 2) may only contain SUB_COMMAND (type 1)
+    # children; a leaf option directly inside a group must be rejected.
+    def test_accepts_group_with_only_subcommands(self):
+        cmd = {
+            "name": "admin",
+            "description": "d",
+            "options": [
+                {
+                    "type": 2,
+                    "name": "user",
+                    "description": "d",
+                    "options": [{"type": 1, "name": "add", "description": "d"}],
+                }
+            ],
+        }
+        assert problems_for([cmd]) == ""
+
+    def test_rejects_leaf_option_inside_group(self):
+        cmd = {
+            "name": "admin",
+            "description": "d",
+            "options": [
+                {
+                    "type": 2,
+                    "name": "user",
+                    "description": "d",
+                    "options": [{"type": 3, "name": "leaf", "description": "d"}],
+                }
+            ],
+        }
+        msg = problems_for([cmd])
+        assert "may only contain subcommands" in msg
+
+
+class TestChoiceNameBounds:
+    # FIX 5: each choice name must be a string of 1..100 chars; empty and
+    # non-string names must be rejected (not just overlong ones).
+    def _cmd(self, name):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {
+                    "type": 3,
+                    "name": "o",
+                    "description": "d",
+                    "choices": [{"name": name, "value": "v"}],
+                }
+            ],
+        }
+
+    def test_accepts_valid_choice_name(self):
+        assert problems_for([self._cmd("One")]) == ""
+
+    def test_rejects_empty_choice_name(self):
+        msg = problems_for([self._cmd("")])
+        assert "choice name must not be empty" in msg
+
+    def test_rejects_non_string_choice_name(self):
+        msg = problems_for([self._cmd(123)])
+        assert "choice name must be a string" in msg
+
+
+class TestRequiredIsBoolean:
+    # FIX 6: "required" must be a boolean when present; the string "false" (and
+    # other non-booleans) must be rejected instead of silently coercing truthy.
+    def _cmd(self, required):
+        return {
+            "name": "cmd",
+            "description": "d",
+            "options": [
+                {"type": 3, "name": "o", "description": "d", "required": required}
+            ],
+        }
+
+    def test_accepts_boolean_required(self):
+        assert problems_for([self._cmd(True)]) == ""
+
+    def test_rejects_string_required(self):
+        msg = problems_for([self._cmd("false")])
+        assert "required must be a boolean" in msg
+
+
 class TestSubcommandLeafMixing:
     def test_rejects_mixed_subcommand_and_leaf(self):
         cmd = {

@@ -44,6 +44,14 @@ ROUTE_KINDS = (
     "message_commands",
 )
 
+# Route kinds whose router has NO env route-map override: the modal and
+# autocomplete routers always derive their worker Lambda name mechanically
+# (discord-modal-<prefix> / discord-autocomplete-<path>-<option>). A
+# non-mechanical target on these kinds is dead config that can never be
+# invoked, so it is a hard ERROR rather than the supported-override WARNING that
+# the map-backed kinds (commands / *_commands / components) get.
+MAPLESS_ROUTE_KINDS = ("modals", "autocomplete")
+
 
 def read_json(path: Path):
     try:
@@ -256,6 +264,23 @@ def _check_choices(option, subject: str, problems):
             f"{subject} sets both autocomplete and choices, which are mutually exclusive"
         )
 
+    # FIX 2: autocomplete is only legal on STRING(3)/INTEGER(4)/NUMBER(10). It
+    # must be rejected on any other type even when no choices are declared.
+    if option.get("autocomplete") is True and otype not in _CHOICE_VALUE_TYPE_NAME:
+        problems.append(
+            f"{subject} sets autocomplete on option type {otype!r}; "
+            "autocomplete is only valid on STRING, INTEGER, or NUMBER options"
+        )
+
+    # FIX 3: static choices are only legal on STRING(3)/INTEGER(4)/NUMBER(10).
+    # A non-choice option type carrying choices must be rejected (previously the
+    # type check was skipped entirely for such options).
+    if choices is not None and otype not in _CHOICE_VALUE_TYPE_NAME:
+        problems.append(
+            f"{subject} declares choices on option type {otype!r}; "
+            "choices are only valid on STRING, INTEGER, or NUMBER options"
+        )
+
     if choices is None:
         return
     if not isinstance(choices, list):
@@ -273,8 +298,14 @@ def _check_choices(option, subject: str, problems):
         if "name" not in choice or "value" not in choice:
             problems.append(f"{subject} each choice must include a name and value")
             continue
+        # FIX 5: a choice name must be a string of 1..100 chars. Previously only
+        # overlong strings were caught, so "" and non-strings slipped through.
         cname = choice.get("name")
-        if isinstance(cname, str) and len(cname) > 100:
+        if not isinstance(cname, str):
+            problems.append(f"{subject} choice name must be a string")
+        elif len(cname) == 0:
+            problems.append(f"{subject} choice name must not be empty")
+        elif len(cname) > 100:
             problems.append(f"{subject} choice name {cname!r} exceeds 100 characters")
         cvalue = choice.get("value")
         if isinstance(cvalue, str) and len(cvalue) > 100:
@@ -341,6 +372,22 @@ def _check_options(options, container_type, subject: str, problems):
         ):
             problems.append(f"{opt_subject} has unsupported type {otype!r}")
 
+        # FIX 4: a SUB_COMMAND_GROUP (type 2) may only contain SUB_COMMAND
+        # (type 1) children. A leaf option directly inside a group was
+        # previously accepted; reject it. (A group nested in a group is caught
+        # by the nesting-depth rule below, so it is excluded here.)
+        if (
+            container_type == _OPT_SUBCOMMAND_GROUP
+            and isinstance(otype, int)
+            and not isinstance(otype, bool)
+            and otype in _OPTION_TYPES
+            and otype not in (_OPT_SUBCOMMAND, _OPT_SUBCOMMAND_GROUP)
+        ):
+            problems.append(
+                f"{opt_subject} is inside a subcommand group, which "
+                "may only contain subcommands"
+            )
+
         if not _chat_name_ok(oname):
             problems.append(
                 f"{subject} option name {oname!r} must be 1-32 characters "
@@ -380,7 +427,15 @@ def _check_options(options, container_type, subject: str, problems):
                 )
             _check_options(option.get("options"), otype, opt_subject, problems)
         else:
-            required = bool(option.get("required", False))
+            # FIX 6: "required" must be a boolean when present. A non-boolean
+            # (e.g. the string "false") would otherwise coerce truthy via bool()
+            # and silently distort the required-before-optional ordering check.
+            raw_required = option.get("required", False)
+            if "required" in option and not isinstance(raw_required, bool):
+                problems.append(
+                    f"{opt_subject} required must be a boolean when present"
+                )
+            required = bool(raw_required)
             if required and seen_optional:
                 problems.append(
                     f"{opt_subject} is required and must come before optional options"
@@ -702,6 +757,15 @@ def check_route_consistency(modules):
                     f"{prefix} {kind} route {key!r} target Lambda folder "
                     f"{target!r} does not exist in the module"
                 )
+        elif kind in MAPLESS_ROUTE_KINDS:
+            # No env route-map override exists for these routers, so a
+            # non-mechanical target is dead config (FIX 1): hard ERROR.
+            errors.append(
+                f"{prefix} {kind} route {key!r} has a non-mechanical route "
+                f"target {target!r}, but the {kind} router has no route-map "
+                f"override; the target must equal the mechanical derivation "
+                f"{derived!r}"
+            )
         else:
             warnings.append(_override_warning(prefix, kind, key, target, derived))
 
