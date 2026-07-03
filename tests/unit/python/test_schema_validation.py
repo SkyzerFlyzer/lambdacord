@@ -823,3 +823,37 @@ class TestCommandCountReporting:
     def test_module_without_commands_file_counts_zero(self, repo_root, make_module):
         make_module("demo", minimal_manifest("demo"))  # no commands file on disk
         assert command_count_by_module(repo_root) == {"demo": 0}
+
+
+class TestStrictEnumIntegers:
+    def test_boolean_integration_type_rejected(self):
+        import discord_modules
+
+        problems = discord_modules.validate_command_schema(
+            [{"name": "x", "description": "d", "integration_types": [True]}], "m"
+        )
+        assert any("integration_types" in p for p in problems)
+
+    def test_float_context_rejected(self):
+        import discord_modules
+
+        problems = discord_modules.validate_command_schema(
+            [{"name": "x", "description": "d", "contexts": [1.0]}], "m"
+        )
+        assert any("contexts" in p for p in problems)
+
+    def test_integer_enums_accepted(self):
+        import discord_modules
+
+        problems = discord_modules.validate_command_schema(
+            [
+                {
+                    "name": "x",
+                    "description": "d",
+                    "integration_types": [0, 1],
+                    "contexts": [0, 1, 2],
+                }
+            ],
+            "m",
+        )
+        assert not any("integration_types" in p or "contexts" in p for p in problems)

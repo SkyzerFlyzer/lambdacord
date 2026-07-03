@@ -426,3 +426,12 @@ TEST_CASE("modal composes one of each input type wrapped in Labels and fits in 5
         CHECK(child["type"] == 18);
     }
 }
+
+TEST_CASE("radio option values clamp without an ellipsis") {
+    using namespace discord_interactions;
+    const std::string big(150, 'v');
+    const json option = radio_option("label", big);
+    const std::string value = option["value"].get<std::string>();
+    CHECK(value.size() == 100);
+    CHECK(value.find("\xE2\x80\xA6") == std::string::npos);
+}

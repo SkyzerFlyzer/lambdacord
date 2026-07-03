@@ -246,3 +246,28 @@ TEST_CASE("action_row from components.hpp composes inside a container") {
     CHECK(m["components"][0]["components"][0]["type"] == 1);
     CHECK(m["components"][0]["components"][0]["components"][0]["type"] == 2);
 }
+
+TEST_CASE("section rejects non-text-display children and bad accessories") {
+    using namespace discord_interactions;
+    const json td = text_display("hello");
+    const json btn = button(ButtonStyle::secondary, "id", "b");
+    CHECK_THROWS_AS(section(json::array({btn}), btn), ModuleError);
+    CHECK_THROWS_AS(section(json::array({td}), json{{"type", 3}}), ModuleError);
+    CHECK_NOTHROW(section(json::array({td}), btn));
+    CHECK_NOTHROW(section(json::array({td}), thumbnail_component("https://x/y.png")));
+}
+
+TEST_CASE("media_gallery rejects malformed items") {
+    using namespace discord_interactions;
+    CHECK_THROWS_AS(media_gallery(json::array({json{{"description", "no media"}}})), ModuleError);
+    CHECK_THROWS_AS(media_gallery(json::array({json{{"media", json::object()}}})), ModuleError);
+    CHECK_NOTHROW(media_gallery(json::array({json{{"media", {{"url", "https://x/y.png"}}}}})));
+}
+
+TEST_CASE("components_v2_message rejects non-array and empty payloads") {
+    using namespace discord_interactions;
+    CHECK_THROWS_AS(components_v2_message(json::object()), ModuleError);
+    CHECK_THROWS_AS(components_v2_message(json("nope")), ModuleError);
+    CHECK_THROWS_AS(components_v2_message(json::array()), ModuleError);
+    CHECK_NOTHROW(components_v2_message(json::array({text_display("ok")})));
+}

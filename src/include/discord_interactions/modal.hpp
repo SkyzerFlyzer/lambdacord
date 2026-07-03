@@ -152,7 +152,8 @@ inline json radio_option(const std::string& label, const std::string& value,
                          bool is_default = false) {
     json option = json::object();
     option["label"] = safe_truncate(label, limits::choice_name);
-    option["value"] = safe_truncate(value, limits::choice_name);
+    // Values round-trip through modal submits — machine-facing, never ellipsized.
+    option["value"] = clamp_utf8(value, limits::choice_name);
     if (!description.empty()) {
         option["description"] = safe_truncate(description, limits::choice_name);
     }

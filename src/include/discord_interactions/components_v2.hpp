@@ -81,6 +81,17 @@ inline json section(const json& text_displays, const json& accessory) {
                            "section requires 1 to 3 text displays, got " +
                                std::to_string(count));
     }
+    for (const auto& child : text_displays) {
+        if (!child.is_object() || child.value("type", 0) != 10) {
+            throw MODULE_ERROR("invalid_section", ErrorCategory::validation,
+                               "section children must be text displays (type 10)");
+        }
+    }
+    const int accessory_type = accessory.is_object() ? accessory.value("type", 0) : 0;
+    if (accessory_type != 2 && accessory_type != 11) {
+        throw MODULE_ERROR("invalid_section", ErrorCategory::validation,
+                           "section accessory must be a button (2) or thumbnail (11)");
+    }
     json result = json::object();
     result["type"] = 9;
     result["components"] = text_displays;
@@ -97,6 +108,15 @@ inline json media_gallery(const json& items) {
         throw MODULE_ERROR("invalid_media_gallery", ErrorCategory::validation,
                            "media gallery requires 1 to 10 items, got " +
                                std::to_string(count));
+    }
+    for (const auto& item : items) {
+        const bool shaped = item.is_object() && item.contains("media") &&
+                            item["media"].is_object() &&
+                            item["media"].value("url", std::string{}) != "";
+        if (!shaped) {
+            throw MODULE_ERROR("invalid_media_gallery_item", ErrorCategory::validation,
+                               "media gallery items must be objects with media.url");
+        }
     }
     json result = json::object();
     result["type"] = 12;
@@ -180,11 +200,13 @@ inline std::size_t count_components_v2(const json& node) {
 // limits::components_per_message; throws ModuleError(code="too_many_components_v2",
 // category=validation) when exceeded.
 inline json components_v2_message(const json& components) {
+    if (!components.is_array() || components.empty()) {
+        throw MODULE_ERROR("invalid_components_v2", ErrorCategory::validation,
+                           "components v2 message requires a non-empty component array");
+    }
     std::size_t total = 0;
-    if (components.is_array()) {
-        for (const auto& node : components) {
-            total += detail::count_components_v2(node);
-        }
+    for (const auto& node : components) {
+        total += detail::count_components_v2(node);
     }
     if (total > limits::components_per_message) {
         throw MODULE_ERROR("too_many_components_v2", ErrorCategory::validation,

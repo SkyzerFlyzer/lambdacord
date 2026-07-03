@@ -428,3 +428,22 @@ class TestAutocompleteTemplate:
 
     def test_does_not_patch(self, repo_root, make_module):
         assert "patch_original_response" not in self._generate(repo_root, make_module)
+
+
+class TestTypeAwareSchemaReuse:
+    def test_context_menu_entry_is_not_mutated(self, repo_root, make_module):
+        make_module("menus", base_manifest(name="menus"),
+                    commands=[{"name": "report", "type": 2}])
+
+        result = run_cli(repo_root, "--module", "menus", "--kind", "command",
+                         "--path", "report")
+        assert result.returncode == 0, result.stderr
+
+        commands_path = repo_root / "modules" / "menus" / "discord.commands.json"
+        entries = json.loads(commands_path.read_text(encoding="utf-8"))
+        context_menu = [e for e in entries if e.get("type") == 2]
+        chat_input = [e for e in entries if e.get("type") in (None, 1)]
+        assert context_menu == [{"name": "report", "type": 2}]
+        assert len(chat_input) == 1
+        assert chat_input[0]["name"] == "report"
+        assert "description" in chat_input[0]

@@ -501,13 +501,15 @@ def _check_command(command, module_name: str, problems):
 
     integration_types = command.get("integration_types")
     if integration_types is not None and not (
-        isinstance(integration_types, list) and all(v in (0, 1) for v in integration_types)
+        isinstance(integration_types, list)
+        and all(isinstance(v, int) and not isinstance(v, bool) and v in (0, 1) for v in integration_types)
     ):
         problems.append(f"{subject} integration_types must be a subset of {{0, 1}}")
 
     contexts = command.get("contexts")
     if contexts is not None and not (
-        isinstance(contexts, list) and all(v in (0, 1, 2) for v in contexts)
+        isinstance(contexts, list)
+        and all(isinstance(v, int) and not isinstance(v, bool) and v in (0, 1, 2) for v in contexts)
     ):
         problems.append(f"{subject} contexts must be a subset of {{0, 1, 2}}")
 

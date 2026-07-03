@@ -93,7 +93,14 @@ def ensure_schema_path(commands, path_tokens):
     """
     top = None
     for entry in commands:
-        if isinstance(entry, dict) and entry.get("name") == path_tokens[0]:
+        # Only reuse CHAT_INPUT entries (type absent or 1): Discord allows a
+        # context-menu command (type 2/3) with the same name, and mutating one
+        # of those here would corrupt it with description/options fields.
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == path_tokens[0]
+            and entry.get("type") in (None, 1)
+        ):
             top = entry
             break
     if top is None:
