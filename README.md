@@ -1,83 +1,23 @@
-# Discord Interactions C++ Lambda Framework
+# Lambdacord
 
-This repository contains the main C++ Discord interactions framework for AWS
-Lambda on `provided.al2023`. The framework lives in `src/` as a set of
-header-only helpers (`src/include/discord_interactions/`) compiled into each
-gateway/router/worker Lambda, plus the gateway Lambdas that verify inbound
-Discord requests and route them by interaction type.
+A C++ Discord interactions framework for AWS Lambda on `provided.al2023`
+(arm64 by default). Discord sends interactions over HTTPS; a small set of
+gateway Lambdas verify signatures and route by interaction type; per-module
+worker Lambdas do the work. No gateway websocket, no always-on server.
 
-What the framework covers:
+The framework is a set of header-only helpers
+(`src/include/discord_interactions/`) compiled into each Lambda, covering
+ingress and routing, rate-limit-aware Discord REST, response builders
+(embeds, components, Components V2, modals, autocomplete, pagination),
+structured `custom_id` state, structured module errors, and opt-in
+DynamoDB-backed interaction dedup.
 
-- **Ingress & routing** — Ed25519 signature verification, dispatch by interaction
-  type, and mechanical routing of slash commands, user/message context menus,
-  components, modals, and autocomplete to per-module worker Lambdas.
-- **Rate-limit-aware REST** — a curl-based Discord REST core with 429/5xx retry
-  whose wait budget is clamped to the Lambda invocation deadline (sync interaction
-  paths never sleep-retry), plus the interaction-webhook message lifecycle
-  (followup / edit / delete).
-- **Response builders** — embeds, message components (buttons, selects, action
-  rows), Components V2 layouts, modals, autocomplete choices, pagination, premium
-  buttons, and Discord formatting utilities, all clamped to Discord's documented
-  limits.
-- **State & correctness** — a structured `custom_id` state codec (the only
-  serverless state channel), typed command-option access, structured module
-  errors, ephemeral deferred ACKs declared per command, and opt-in DynamoDB-backed
-  interaction dedup (completion-marker default, at-most-once claim opt-in).
-- **Developer tooling** — a scaffolding generator for new module Lambdas, a fast
-  C++ (doctest) and Python (pytest) unit-test layer, and a GitHub Actions CI
-  workflow that runs both plus static checks on every push and pull request.
+Feature modules are locally installed repos under `modules/<name>/` that
+bring their own commands, Lambdas, error mappings, and Terraform. This root
+repo owns only the generic framework; read `modules/<name>/README.md` for a
+module's behavior.
 
-The per-header API reference — signatures, usage examples, and the architecture
-contract — is in [`docs/framework-reference.md`](docs/framework-reference.md).
-
-Feature modules are locally installed repos under `modules/<name>/`. A module owns its
-own command schema, Lambda folders, error mappings, Terraform, and module docs.
-The root README intentionally avoids documenting module-specific commands or
-infrastructure; read `modules/<name>/README.md` for that module's behavior.
-
-## Repository Layout
-
-```text
-src/
-  include/discord_interactions/  # generic Discord interaction helpers
-  lambdas/                       # framework gateway/router Lambdas
-
-modules/<name>/                  # locally installed module repos, ignored by parent Git
-  README.md                      # module user docs
-  AGENTS.md                      # module agent/developer instructions
-  CLAUDE.md                      # module agent/developer instructions
-  module.manifest.json           # routes, Lambda folders, error mapper, Terraform path
-  discord.commands.json          # Discord command schema contributed by the module
-  errors.json                    # safe error-response mappings
-  lambdas/                       # module-owned command/component/error Lambdas
-  terraform/                     # module-owned infrastructure
-
-infra/terraform/                 # root orchestration, calls installed module Terraform
-scripts/                         # user entrypoints plus helper scripts
-packaged-lambdas/                # generated zip artifacts
-```
-
-## User Scripts
-
-These are the scripts normal project users should reach for:
-
-| Script | Purpose |
-|---|---|
-| `scripts/build-lambda.sh <lambda-folder>` | Build one C++ Lambda zip from a framework or module Lambda folder. |
-| `scripts/build-all-lambdas.sh` | Build every Lambda declared by the framework and installed module manifests. Run this before Terraform deploys. |
-| `scripts/test-unit.sh` | Run the fast C++ unit test suite (doctest) in seconds. Compiles `tests/unit/cpp/` against `src/include` inside the builder image; no zip build or emulator needed. Optional `--filter <doctest-filter>`. |
-| `scripts/test-local-discord-lambdas.sh` | Run the local Discord Lambda integration suites against built zip artifacts. |
-| `scripts/generate-terraform-modules.py` | Regenerate root Terraform module wiring from installed module manifests. |
-| `scripts/terraform-deploy.sh <action>` | Regenerate module Terraform wiring, optionally build Lambdas, then run Terraform `init`, `validate`, `plan`, `apply`, or `output`. |
-| `scripts/new-lambda.py --module <name> --kind command\|component\|modal\|autocomplete --path "..."` | Scaffold a correctly named module Lambda skeleton (AGENTS.md-compliant `main.cpp`), wire its manifest route, and append a schema stub for command kinds. Autocomplete also takes `--option`; `--dry-run` previews without writing. |
-| `scripts/register-discord-commands.py` | Merge installed module command schemas and bulk overwrite Discord application commands. |
-| `scripts/register-discord-commands.py --validate-only` | Validate installed module manifests, routes, command schemas, error schemas, Lambda folders, and Terraform folders without calling Discord. |
-| `scripts/remove-discord-commands.py` | Clear registered Discord commands for a guild or globally. |
-| `scripts/print-module-route-map.py <kind>` | Print the merged module route map for `commands`, `components`, `modals`, or `autocomplete`. |
-| `scripts/install-git-hooks.sh` | Install the repository pre-commit hook locally. |
-
-Lower-level helper scripts used by the build system, tests, hooks, or agents
-are documented in `AGENTS.md`/`CLAUDE.md` rather than as normal user entrypoints.
+The project's design principles live in [`SOUL.md`](SOUL.md).
 
 ## Requirements
 
@@ -85,333 +25,101 @@ are documented in `AGENTS.md`/`CLAUDE.md` rather than as normal user entrypoints
 - Python 3 for command registration and local test tooling
 - Terraform for AWS deployment
 
-No local C++ compiler is required. All C++ builds run inside an Amazon Linux
-2023 Docker builder image.
+No local C++ compiler is required — all C++ builds run inside an Amazon
+Linux 2023 Docker builder image.
 
-## Build
+## Quickstart
 
-Build one Lambda:
-
-```bash
-scripts/build-lambda.sh src/lambdas/discord-interactions
-scripts/build-lambda.sh modules/<name>/lambdas/<lambda-folder>
-```
-
-Build all framework and installed module Lambdas:
+Build every framework and installed-module Lambda
+(zips land in `packaged-lambdas/`):
 
 ```bash
 scripts/build-all-lambdas.sh
 ```
 
-Build for x86_64 instead of the default arm64:
+Run the fast unit tests:
 
 ```bash
-LAMBDA_ARCH=x86_64 scripts/build-lambda.sh modules/<name>/lambdas/<lambda-folder>
+scripts/test-unit.sh                  # C++ (doctest), inside the builder image
+python3 -m pytest tests/unit/python   # Python (pytest), no Docker
 ```
 
-Reuse an existing builder image:
+Run the full local integration suites (RIE containers + mock control plane):
 
 ```bash
-LAMBDA_SKIP_IMAGE_BUILD=1 scripts/build-lambda.sh modules/<name>/lambdas/<lambda-folder>
+scripts/test-local-discord-lambdas.sh
 ```
 
-Zip artifacts are written to `packaged-lambdas/<lambda-name>.zip`.
+Register your commands with Discord (guild-scoped is instant — use it while
+iterating; omit `DISCORD_GUILD_ID` for global):
 
-The build script auto-generates a temporary CMake project from all `*.cpp`,
-`*.cc`, and `*.cxx` files found in the Lambda folder. If a Lambda folder
-contains its own `CMakeLists.txt`, the build script uses that instead.
+```bash
+DISCORD_BOT_TOKEN="..." DISCORD_APPLICATION_ID="..." DISCORD_GUILD_ID="..." \
+python3 scripts/register-discord-commands.py
+```
 
-The builder image includes:
+Deploy with Terraform (regenerates module wiring, builds zips, then applies;
+the stack outputs the Function URL to paste into the Discord Developer
+Portal as the Interactions Endpoint URL):
 
-| Library | Source |
+```bash
+scripts/terraform-deploy.sh apply
+```
+
+Scaffold a new module command Lambda:
+
+```bash
+python3 scripts/new-lambda.py --module <name> --kind command --path "account link"
+```
+
+## Documentation
+
+Everything beyond this quickstart lives in the wiki under `docs/`, built
+with [MkDocs](https://www.mkdocs.org/):
+
+```bash
+pip install mkdocs
+mkdocs serve        # browse at http://127.0.0.1:8000
+```
+
+The pages are plain Markdown, so they also read fine directly in a browser
+or editor:
+
+| Page | What's there |
 |---|---|
-| `aws-lambda-cpp` | Built from source |
-| `aws-sdk-cpp` | Built from source with the clients this project needs |
-| `libsodium` | Amazon Linux 2023 DNF |
-| `libcurl` | Amazon Linux 2023 DNF |
-| `nlohmann/json` | CMake `FetchContent` |
+| [Philosophy](SOUL.md) | The design principles the whole repo follows. |
+| [Getting Started](docs/getting-started.md) | Requirements, building Lambdas, running tests. |
+| [Architecture](docs/architecture.md) | Repo layout, gateway Lambdas, interaction routing, the deferred-ACK/PATCH contract. |
+| [Modules](docs/modules.md) | The module contract, manifests, routes, scaffolding. |
+| [Command Registration](docs/command-registration.md) | Registering, validating, and removing Discord commands. |
+| [Deployment](docs/deployment.md) | Terraform layout, generated wiring, the deploy wrapper. |
+| [Testing](docs/testing.md) | Unit suites, the integration harness, the mock server API, CI. |
+| [Environment Variables](docs/environment-variables.md) | Every env var the framework reads. |
+| [Errors & Idempotency](docs/error-handling.md) | Structured errors, error categories, interaction dedup. |
+| [Scripts Reference](docs/scripts.md) | Every script, user-facing and internal. |
+| [Framework API Reference](docs/framework-reference.md) | Per-header reference for `src/include/discord_interactions/`. |
 
-## Framework Lambdas
+Agent/developer workflow rules are in [`AGENTS.md`](AGENTS.md)
+(`CLAUDE.md` is a symlink to it).
 
-The generic Discord flow is split into framework Lambdas under `src/lambdas`:
+## The one rule to know
 
-| Lambda folder | Zip name | Purpose |
-|---|---|---|
-| `src/lambdas/discord-interactions` | `discord-interactions.zip` | Ingress gateway, verifies Discord Ed25519 signatures, handles Discord `PING`, and dispatches by interaction type. |
-| `src/lambdas/discord-application-command-handler` | `discord-application-command-handler.zip` | Routes slash commands through the merged module command route map. |
-| `src/lambdas/discord-message-component-handler` | `discord-message-component-handler.zip` | Routes component interactions through the merged module component route map. |
-| `src/lambdas/discord-modal-handler` | `discord-modal-handler.zip` | Routes modal submits through the merged module modal route map. |
-| `src/lambdas/discord-autocomplete-handler` | `discord-autocomplete-handler.zip` | Routes autocomplete interactions through the merged module autocomplete route map. |
-
-Interaction routing:
-
-```text
-Discord HTTP POST
-  -> discord-interactions
-       type 1 PING            -> inline PONG
-       type 2 command         -> discord-application-command-handler -> module command Lambda
-       type 3 component       -> discord-message-component-handler   -> module component Lambda
-       type 4 autocomplete    -> discord-autocomplete-handler        -> module autocomplete Lambda
-       type 5 modal submit    -> discord-modal-handler               -> module modal Lambda
-```
-
-Modules contribute downstream Lambdas through `module.manifest.json`. The
-framework does not need to know module-specific command names at compile time.
-
-The framework invokes downstream command/component/modal worker Lambdas
-asynchronously after sending Discord a deferred acknowledgement. Because of
-that, a worker Lambda's `invocation_response` is only runtime bookkeeping and is
-not sent to Discord. Any user-visible command result, component update, or safe
-error message must be sent by PATCHing the original interaction response:
+Worker Lambdas are invoked asynchronously after Discord has already received
+a deferred acknowledgement. A worker's return value is never shown to the
+user — anything user-visible must be sent by PATCHing the original
+interaction response:
 
 ```text
 PATCH /webhooks/<application_id>/<interaction_token>/messages/@original
 ```
 
-Do not return a Discord interaction response payload from a worker Lambda and
-expect Discord to render it.
-
-## Module Contract
-
-Each installed module should provide:
-
-- `README.md` for module users.
-- `AGENTS.md` and `CLAUDE.md` for module-specific agent/developer rules.
-- `module.manifest.json` with module name, command schema path, error schema
-  path, route maps, error mapper Lambda, Lambda folders, and Terraform path.
-- `discord.commands.json` with the module's Discord application commands.
-- `errors.json` with safe Discord-facing responses for module error codes.
-- `lambdas/` with module-owned command/component/modal/autocomplete/error
-  Lambdas.
-- `terraform/` when the module owns AWS infrastructure.
-
-Command/component/modal Lambdas must read `application_id` and `token` from the
-raw interaction payload and PATCH the original deferred response for all
-success and error cases. Returning `{"type": 4, ...}` or another Discord
-payload from the Lambda handler is not sufficient because downstream workers
-are invoked asynchronously.
-
-Module discovery for build, route validation, and command registration is
-filesystem-based from `modules/*/module.manifest.json`.
-
-A command route value may be either a plain Lambda-name string or an object
-form that opts the command into an ephemeral deferred ACK (the "thinking…"
-state only the invoking user can see):
-
-```json
-"routes": {
-  "commands": {
-    "account list": "discord-cmd-account-list",
-    "account link": { "lambda": "discord-cmd-account-link", "ephemeral_defer": true }
-  }
-}
-```
-
-`scripts/generate-terraform-modules.py` merges every installed module's
-opt-ins into the ingress Lambda's `DISCORD_EPHEMERAL_DEFER_ROUTES` environment
-variable through the generated Terraform — rerun it after changing the flag.
-
-Terraform is different: Terraform itself cannot dynamically instantiate
-arbitrary module sources by scanning the filesystem. This repo handles that by
-generating root Terraform wiring from installed module manifests into
-`infra/terraform/generated_*.tf`; run `scripts/generate-terraform-modules.py`
-directly, or use `scripts/terraform-deploy.sh`, which runs it for you.
-
-## Scaffolding A New Lambda
-
-`scripts/new-lambda.py` generates a correctly named Lambda skeleton inside a
-module, wires its `module.manifest.json` route, appends a schema stub for
-command kinds, and prints a next-step checklist. The generated `main.cpp`
-already follows the framework rules (value-init with `{}`, `application_id`/
-`token` via `discord_interactions::metadata`, deferred PATCH via
-`patch_original_response` on success and safe-error paths, `MODULE_ERROR` for
-expected failures, internals logged to stderr only). Autocomplete instead
-returns the synchronous `{type:8}` choice payload via `autocomplete_response`.
-
-```bash
-# Slash command (path is "group sub" / "group subgroup sub")
-python3 scripts/new-lambda.py --module <name> --kind command --path "account link"
-
-# Message component / modal (path is the custom_id prefix, a single token)
-python3 scripts/new-lambda.py --module <name> --kind component --path vote
-python3 scripts/new-lambda.py --module <name> --kind modal --path feedback
-
-# Autocomplete (requires --option)
-python3 scripts/new-lambda.py --module <name> --kind autocomplete \
-    --path weather --option city
-
-# Preview without writing anything
-python3 scripts/new-lambda.py --module <name> --kind command --path "account link" --dry-run
-```
-
-The generator refuses (non-zero exit) if the route already exists. After
-scaffolding, implement the `TODO`, build with `scripts/build-lambda.sh`, and
-register with `scripts/register-discord-commands.py`.
-
-## Discord Command Registration
-
-Validate installed module manifests and command schemas without calling Discord:
-
-```bash
-python3 scripts/register-discord-commands.py --validate-only
-```
-
-Register guild-scoped commands while iterating:
-
-```bash
-DISCORD_BOT_TOKEN="your-bot-token" \
-DISCORD_APPLICATION_ID="your-app-id" \
-DISCORD_GUILD_ID="your-guild-id" \
-python3 scripts/register-discord-commands.py
-```
-
-Register global commands:
-
-```bash
-DISCORD_BOT_TOKEN="your-bot-token" \
-DISCORD_APPLICATION_ID="your-app-id" \
-python3 scripts/register-discord-commands.py
-```
-
-Clear guild-scoped commands:
-
-```bash
-DISCORD_BOT_TOKEN="your-bot-token" \
-DISCORD_APPLICATION_ID="your-app-id" \
-DISCORD_GUILD_ID="your-guild-id" \
-python3 scripts/remove-discord-commands.py
-```
-
-Clear global commands:
-
-```bash
-DISCORD_BOT_TOKEN="your-bot-token" \
-DISCORD_APPLICATION_ID="your-app-id" \
-python3 scripts/remove-discord-commands.py --global
-```
-
-Print the merged route map:
-
-```bash
-python3 scripts/print-module-route-map.py commands
-python3 scripts/print-module-route-map.py components
-```
-
-Copy `.env.example` to `.env` if you want a local place to keep Discord command
-registration values.
-
-Discord REST calls default to API version `10`, which is currently the latest
-available version in Discord's official API reference. Set
-`DISCORD_API_VERSION` to use a different version, or set
-`DISCORD_API_BASE_URL` to override the full API base URL for local tests.
-
-## Terraform Deploy
-
-Root Terraform lives in `infra/terraform`. It deploys the generic framework
-infrastructure and calls each installed module's Terraform explicitly.
-
-Build all zip artifacts first:
-
-```bash
-scripts/build-all-lambdas.sh
-```
-
-Then configure and deploy from the root stack:
-
-```bash
-cd infra/terraform
-cp terraform.tfvars.example terraform.tfvars
-# fill in the root variables
-terraform init
-terraform validate
-terraform plan
-terraform apply
-```
-
-Or use the wrapper script from the repo root:
-
-```bash
-scripts/terraform-deploy.sh plan
-scripts/terraform-deploy.sh apply
-```
-
-The wrapper regenerates `infra/terraform/generated_*.tf` files from installed
-module manifests before running Terraform. It also builds Lambda zips unless
-you pass `--skip-build`.
-
-The root stack outputs the Discord interactions Function URL. Use that URL as
-the Interactions Endpoint URL in the Discord Developer Portal.
-
-For module-specific Terraform variables, resources, and outputs, read that
-module's `README.md`. Modules may provide their own `terraform.tfvars.example`
-with values to copy into the root stack's `terraform.tfvars` or pass as an
-additional Terraform var-file.
-
-## Local Testing
-
-The fast C++ unit tests need no zip build or emulator — just Docker (the suite
-compiles and runs inside the builder image, on your host architecture):
-
-```bash
-scripts/test-unit.sh                       # run all C++ unit tests
-scripts/test-unit.sh --filter 'route*'     # run a subset by doctest filter
-```
-
-Add a test by dropping `tests/unit/cpp/test_<name>.cpp`; it is picked up
-automatically. The integration suites below additionally require built zips.
-
-Build all zips before running local tests:
-
-```bash
-scripts/build-all-lambdas.sh
-scripts/test-local-discord-lambdas.sh
-```
-
-The test script spins up local Lambda containers via the AWS Lambda Runtime
-Interface Emulator and a lightweight mock Lambda control plane.
-
-Agents and maintainers can call `tests/local/discord/run_local_tests.py`
-directly when selecting a narrower test suite; normal users should use
-`scripts/test-local-discord-lambdas.sh`.
-
-## Hooks And Static Checks
-
-Install the versioned pre-commit hook:
-
-```bash
-scripts/install-git-hooks.sh
-```
-
-The hook runs static checks for staged C++ Lambda targets. The lower-level
-static-check script is documented in `AGENTS.md`.
-
-## Error Handling
-
-The framework uses structured module errors instead of exception-text matching.
-Core categories are generic, while error codes are namespaced strings owned by
-modules.
-
-Module command/component Lambdas should return or throw structured errors with:
-
-- `code`
-- `category`
-- `internal_message`
-- `function`
-- `safe_context`
-- `debug_context`
-
-On module failure, module code should map the structured error to a safe
-Discord payload and PATCH the original deferred response. Error-mapper Lambdas
-may return safe payloads to internal callers, but user-visible output still has
-to reach Discord through the original-response PATCH flow.
+See [Architecture](docs/architecture.md) for the full contract.
 
 ## Conventions
 
-- C++17.
-- Lambda runtime: `provided.al2023`.
-- Default architecture: `arm64`.
-- Generic Discord behavior belongs under `src/`.
-- Module-specific commands, components, external API helpers, storage, error
-  mappings, and Terraform belong under `modules/<name>/`.
+- C++17, Lambda runtime `provided.al2023`, default architecture `arm64`.
+- Generic Discord behavior belongs under `src/`; module-specific commands,
+  storage, external APIs, error mappings, and Terraform belong under
+  `modules/<name>/`.
 - Never send raw exception text, upstream API bodies, provider errors, or
-  internal debug context directly to Discord users.
+  internal debug context to Discord users.

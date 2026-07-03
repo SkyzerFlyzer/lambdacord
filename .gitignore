@@ -13,5 +13,8 @@ modules/
 infra/terraform/generated_*.tf
 infra/terraform/moved.tf
 
+# MkDocs build output (wiki source lives in docs/)
+/site/
+
 # Claude Code session machinery (subagent worktrees, local settings)
 .claude/

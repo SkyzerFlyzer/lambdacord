@@ -1,0 +1,28 @@
+site_name: Lambdacord
+site_description: C++ Discord interactions framework for AWS Lambda (provided.al2023)
+repo_url: https://github.com/SkyzerFlyzer/lambdacord
+repo_name: SkyzerFlyzer/lambdacord
+
+theme:
+  name: readthedocs
+
+# Keep nav in sync with the pages under docs/. docs/philosophy.md is a
+# symlink to ../SOUL.md (same pattern as CLAUDE.md -> AGENTS.md).
+nav:
+  - Home: index.md
+  - Philosophy: philosophy.md
+  - Getting Started: getting-started.md
+  - Architecture: architecture.md
+  - Modules: modules.md
+  - Command Registration: command-registration.md
+  - Deployment: deployment.md
+  - Testing: testing.md
+  - Environment Variables: environment-variables.md
+  - Errors & Idempotency: error-handling.md
+  - Scripts Reference: scripts.md
+  - Framework API Reference: framework-reference.md
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
