@@ -418,3 +418,14 @@ TEST_CASE("string_select accepts boundary min/max ranges") {
     CHECK_NOTHROW(string_select("pick", options, "", 0, 25));
     CHECK_NOTHROW(string_select("pick", options, "", 25, 25));
 }
+
+TEST_CASE("action_row rejects an empty component array") {
+    using namespace discord_interactions;
+    CHECK_THROWS_AS(action_row(json::array()), ModuleError);
+    try {
+        action_row(json::array());
+    } catch (const ModuleError& error) {
+        CHECK(error.code == "empty_action_row");
+        CHECK(error.category == ErrorCategory::validation);
+    }
+}

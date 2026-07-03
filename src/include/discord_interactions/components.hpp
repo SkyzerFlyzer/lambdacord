@@ -204,6 +204,10 @@ inline json action_row(const json& components) {
         throw MODULE_ERROR("mixed_row_components", ErrorCategory::validation,
                            "action row mixes a select menu with buttons");
     }
+    if (!components.is_array() || components.empty()) {
+        throw MODULE_ERROR("empty_action_row", ErrorCategory::validation,
+                           "action row holds no components");
+    }
     json result = json::object();
     result["type"] = 1;
     result["components"] = components;

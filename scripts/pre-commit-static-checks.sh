@@ -150,6 +150,17 @@ else
 
   for staged_file in "${STAGED_FILES[@]}"; do
     [[ "${staged_file}" == *.cpp || "${staged_file}" == *.cc || "${staged_file}" == *.cxx || "${staged_file}" == *.hpp || "${staged_file}" == *.hh || "${staged_file}" == *.h ]] || continue
+
+    # Shared framework headers are compiled into every Lambda, and the unit
+    # suite deliberately excludes the curl/AWS-including ones — a change under
+    # src/include therefore affects every Lambda target, not none.
+    if [[ "${staged_file}" == src/include/* ]]; then
+      for target in "${ALL_TARGETS[@]}"; do
+        add_target "${target}"
+      done
+      continue
+    fi
+
     staged_dir="${REPO_ROOT}/$(dirname "${staged_file}")"
 
     for target in "${ALL_TARGETS[@]}"; do

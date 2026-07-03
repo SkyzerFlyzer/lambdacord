@@ -113,7 +113,7 @@ locals {
   # invoke on each by exact name. Overlap with the wildcard prefixes is harmless.
   module_route_target_names = distinct(flatten([
     for manifest in local.module_manifests : [
-      for _kind, routes in manifest.routes : [
+      for _kind, routes in try(manifest.routes, {}) : [
         for _route, target in routes : try(target.lambda, target)
       ]
     ]
