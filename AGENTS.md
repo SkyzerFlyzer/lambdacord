@@ -14,6 +14,34 @@ the AD-8 deadline rule, and the AD-9 completion-marker default).
 
 ---
 
+## Documentation Map
+
+Project documentation is split by audience. Keep each piece in its lane and
+keep them in sync when behavior changes.
+
+| Location | Audience | Content |
+|---|---|---|
+| `README.md` | New users | Front door only: what the project is, requirements, quickstart commands, doc map. Keep it short — depth belongs in the wiki. |
+| `docs/` + `mkdocs.yml` | Users/developers | The wiki, built with MkDocs (`pip install mkdocs && mkdocs serve`; validate with `mkdocs build --strict`). Pages: getting-started, architecture, modules, command-registration, deployment, testing, environment-variables, error-handling, scripts, framework-reference. |
+| `docs/framework-reference.md` | Developers | Per-header API reference (see above). Part of the wiki nav. |
+| `SOUL.md` | Everyone | Project philosophy / design principles. `docs/philosophy.md` is a symlink to it (same pattern as `CLAUDE.md` → `AGENTS.md`). |
+| `AGENTS.md` / `CLAUDE.md` | Agents | This file — the authoritative agent workflow contract. `CLAUDE.md` is a symlink to `AGENTS.md`; edit `AGENTS.md`. |
+| `modules/<name>/README.md`, `AGENTS.md`, `CLAUDE.md` | Module users/agents | Module-specific behavior. Never duplicated in root docs. |
+
+Sync rules for agents:
+
+- A behavior change must update the matching wiki page under `docs/` in the
+  same change (and this file, when the agent workflow is affected). Several
+  wiki pages restate contracts that also live here — notably
+  environment-variables, testing (mock server API, suites, CI), scripts, and
+  error-handling — so grep the wiki for what you changed.
+- New pages must be added to the `nav` list in `mkdocs.yml`; run
+  `mkdocs build --strict` to catch broken links and orphaned pages.
+- Do not add module-specific documentation to the root README, wiki, or this
+  file.
+
+---
+
 ## Build System
 
 All builds run inside Docker using an Amazon Linux 2023 builder image. There is no local compiler requirement.
@@ -58,12 +86,14 @@ Output zips land in `packaged-lambdas/<lambda-name>.zip`. The `.gitignore` exclu
 
 ## Script Ownership
 
-User-facing entrypoints are documented in `README.md`. Agent/helper scripts are:
+User-facing entrypoints are documented in the wiki
+([`docs/scripts.md`](docs/scripts.md)), with the most common ones surfaced in
+the README quickstart. Agent/helper scripts are:
 
 | Script | Intended use |
 |---|---|
 | `scripts/build-lambda-in-docker.sh` | Internal build implementation called by `scripts/build-lambda.sh` inside the builder container. Do not ask users to call it directly. |
-| `scripts/test-unit.sh` | Compiles and runs the C++ doctest unit suite (`tests/unit/cpp/`) against `src/include` inside the builder image on the host arch. No zip packaging, no RIE. Honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, `LAMBDA_SKIP_IMAGE_BUILD`. Optional `--filter <doctest-filter>`. |
+| `scripts/test-unit.sh` | Compiles and runs the C++ doctest unit suite (`tests/unit/cpp/`) against `src/include` inside the builder image. Defaults to arm64 like the builds (set `LAMBDA_ARCH=x86_64` to run natively on x86_64 hosts). No zip packaging, no RIE. Honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, `LAMBDA_SKIP_IMAGE_BUILD`. Optional `--filter <doctest-filter>`. |
 | `scripts/test-unit-in-docker.sh` | Internal build+run implementation for the C++ unit suite, called by `scripts/test-unit.sh` inside the builder container. Do not ask users to call it directly. |
 | `scripts/lib/discord_modules.py` | Shared Python helper for module manifest discovery, route merging, schema merging, and validation. Import from user-facing scripts instead of duplicating manifest parsing. |
 | `scripts/generate-terraform-modules.py` | Generates root Terraform module calls, pass-through variables, manifest locals, and module output proxies from installed module manifests. Run after adding/removing module Terraform. |
@@ -74,7 +104,10 @@ User-facing entrypoints are documented in `README.md`. Agent/helper scripts are:
 | `tests/local/discord/mock_lambda_server.py` | Local Lambda control-plane mock used by the test harness. |
 
 Keep this section updated whenever adding helper scripts. If a script is meant
-for normal user workflows, document it in `README.md` instead.
+for normal user workflows, document it in the wiki's
+[`docs/scripts.md`](docs/scripts.md) user table instead (and in the README
+quickstart if it is a primary entrypoint). Helper scripts also get a row in
+`docs/scripts.md`'s helper table so users can identify them.
 
 Generated Terraform files live under `infra/terraform/generated_*.tf`. Do not
 edit those files by hand; update module manifests/module Terraform and rerun
@@ -258,7 +291,7 @@ they always derive mechanically.
 
 ## Local Testing
 
-Fast C++ unit tests: `scripts/test-unit.sh` compiles `tests/unit/cpp/*.cpp` against `src/include` inside the builder image (host arch, no zip, no RIE) and runs the doctest suite; exit code propagates. Add a test file by dropping `tests/unit/cpp/test_<name>.cpp` — the CMake `file(GLOB ...)` picks it up with no CMakeLists edit. Filter with `scripts/test-unit.sh --filter '<doctest-filter>'`. It honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, and `LAMBDA_SKIP_IMAGE_BUILD` exactly like `scripts/build-lambda.sh`.
+Fast C++ unit tests: `scripts/test-unit.sh` compiles `tests/unit/cpp/*.cpp` against `src/include` inside the builder image (arm64 by default, like the builds — set `LAMBDA_ARCH=x86_64` to run natively on x86_64 hosts; no zip, no RIE) and runs the doctest suite; exit code propagates. Add a test file by dropping `tests/unit/cpp/test_<name>.cpp` — the CMake `file(GLOB ...)` picks it up with no CMakeLists edit. Filter with `scripts/test-unit.sh --filter '<doctest-filter>'`. It honors `LAMBDA_ARCH`, `LAMBDA_BUILDER_IMAGE`, and `LAMBDA_SKIP_IMAGE_BUILD` exactly like `scripts/build-lambda.sh`.
 
 Fast Python unit tests (no Docker): `python3 -m pytest tests/unit/python` runs the Python unit layer for `scripts/lib`.
 
@@ -332,6 +365,28 @@ The mock server (`tests/local/discord/mock_lambda_server.py`) exposes:
 - `POST /2015-03-31/functions/<name>/invocations` — Lambda-style invocation endpoint
 - `POST /` with header `X-Amz-Target: DynamoDB_20120810.<Op>` — minimal DynamoDB surface (T5.3): `PutItem` (honors `ConditionExpression` `attribute_not_exists(interaction_id)` → `400` with the real `ConditionalCheckFailedException` `__type` shape when the id exists; unconditional puts overwrite) and `GetItem` (`{"Item": ...}` or `{}`) against a single in-memory table keyed by the `interaction_id` `S` value. `__reset` clears the table.
 - `GET /__dynamodb_table` — debug view of the current mock DynamoDB items, keyed by interaction id
+
+### Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request,
+with one in-flight run per ref (a new push cancels the previous run). Three jobs:
+
+- **cpp-unit** — builds the builder image for x86_64 with a GitHub Actions
+  layer cache (so the aws-lambda-cpp / aws-sdk-cpp compile is reused across
+  runs), then runs `LAMBDA_ARCH=x86_64 LAMBDA_SKIP_IMAGE_BUILD=1 scripts/test-unit.sh`.
+- **python-unit** — `python3 -m pytest tests/unit/python -q` on plain Python 3.11.
+- **static-checks** — computes the PR/push diff range (with fallbacks for
+  force-pushes and new branches) and runs
+  `scripts/pre-commit-static-checks.sh --diff-range <range>` with
+  `DISCORD_TEST_PLATFORM=linux/amd64`. For any affected Discord Lambda this
+  builds the gateway zips and runs the RIE integration harness under valgrind,
+  natively on x86_64.
+
+CI does not invoke `scripts/test-local-discord-lambdas.sh` directly: its
+default `linux/arm64` RIE run needs slow, flaky QEMU emulation on the x86_64
+GitHub-hosted runners. When touching test scripts or the builder image, keep
+the CI jobs' `LAMBDA_ARCH=x86_64` / `LAMBDA_SKIP_IMAGE_BUILD=1` /
+`DISCORD_TEST_PLATFORM=linux/amd64` assumptions working.
 
 ---
 
