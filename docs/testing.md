@@ -28,7 +28,8 @@ python3 -m pytest tests/unit/python
 ```
 
 This covers the `scripts/lib` helpers (manifest discovery, route merging,
-schema validation), the scaffolding generator, and the mock server.
+schema validation), the scaffolding generator, the root Terraform module
+wiring derived from installed manifests, and the mock server.
 
 ## Local integration suites
 
